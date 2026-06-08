@@ -1,0 +1,4 @@
+CREATE DATABASE paycore_payment_db;
+CREATE DATABASE paycore_ledger_db;
+CREATE DATABASE paycore_settlement_db;
+CREATE DATABASE paycore_notification_db;

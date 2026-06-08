@@ -1,21 +1,27 @@
 server:
-  port: 8082
+  port: ${SERVER_PORT:8082}
 
 spring:
   application:
     name: payment-service
 
   datasource:
-    url: jdbc:postgresql://localhost:5432/paycore_payment_db
-    username: paycore
-    password: paycore
+    url: ${SPRING_DATASOURCE_URL:jdbc:postgresql://localhost:5432/paycore_payment_db}
+    username: ${SPRING_DATASOURCE_USERNAME:paycore}
+    password: ${SPRING_DATASOURCE_PASSWORD:paycore}
     driver-class-name: org.postgresql.Driver
 
   kafka:
-    bootstrap-servers: localhost:9092
+    bootstrap-servers: ${SPRING_KAFKA_BOOTSTRAP_SERVERS:localhost:9092}
     producer:
       key-serializer: org.apache.kafka.common.serialization.StringSerializer
       value-serializer: org.springframework.kafka.support.serializer.JsonSerializer
+
+  rabbitmq:
+    host: ${SPRING_RABBITMQ_HOST:localhost}
+    port: ${SPRING_RABBITMQ_PORT:5672}
+    username: ${SPRING_RABBITMQ_USERNAME:paycore}
+    password: ${SPRING_RABBITMQ_PASSWORD:paycore}
 
   jpa:
     hibernate:
@@ -25,24 +31,21 @@ spring:
       hibernate:
         format_sql: true
 
-  rabbitmq:
-    host: localhost
-    port: 5672
-    username: paycore
-    password: paycore
-
 services:
   merchant-service:
-    base-url: http://localhost:8081
+    base-url: ${MERCHANT_SERVICE_BASE_URL:http://localhost:8081}
+
   legacy-bank-soap-service:
-    base-url: http://localhost:8084/ws
+    base-url: ${LEGACY_BANK_SOAP_SERVICE_BASE_URL:http://localhost:8084/ws}
+
   fraud-service:
-    base-url: http://localhost:8086
+    base-url: ${FRAUD_SERVICE_BASE_URL:http://localhost:8086}
 
 paycore:
   kafka:
     topics:
       payment-events: payment-events
+
   rabbitmq:
     exchange: notification.exchange
     payment-notification-queue: payment.notification.queue

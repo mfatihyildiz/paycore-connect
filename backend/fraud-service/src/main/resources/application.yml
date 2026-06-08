@@ -1,18 +1,17 @@
 server:
-  port: 8086
+  port: ${SERVER_PORT:8086}
 
 spring:
   application:
     name: fraud-service
 
   mongodb:
-    host: localhost
-    port: 27017
-    database: paycore_fraud_db
-    username: paycore
-    password: paycore
-    authentication-database: admin
-    uuid-representation: standard
+    host: ${SPRING_DATA_MONGODB_HOST:localhost}
+    port: ${SPRING_DATA_MONGODB_PORT:27017}
+    database: ${SPRING_DATA_MONGODB_DATABASE:paycore_fraud_db}
+    username: ${SPRING_DATA_MONGODB_USERNAME:paycore}
+    password: ${SPRING_DATA_MONGODB_PASSWORD:paycore}
+    authentication-database: ${SPRING_DATA_MONGODB_AUTHENTICATION_DATABASE:admin}
 
 paycore:
   fraud:

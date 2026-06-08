@@ -11,6 +11,12 @@ services:
       - "5432:5432"
     volumes:
       - paycore_postgres_data:/var/lib/postgresql/data
+      - ./postgres/init-db.sql:/docker-entrypoint-initdb.d/init-db.sql
+    healthcheck:
+      test: [ "CMD-SHELL", "pg_isready -U paycore -d paycore_merchant_db" ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
 
   redis:
     image: redis:7.2-alpine
@@ -23,7 +29,7 @@ services:
       - paycore_redis_data:/data
 
   kafka:
-    image: apache/kafka:4.1.0
+    image: apache/kafka:3.7.0
     container_name: paycore-kafka
     restart: always
     ports:
@@ -31,17 +37,24 @@ services:
     environment:
       KAFKA_NODE_ID: 1
       KAFKA_PROCESS_ROLES: broker,controller
-      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@paycore-kafka:9093
-      KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093
-      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://localhost:9092
-      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+
+      KAFKA_LISTENERS: PLAINTEXT://:9092,INTERNAL://:29092,CONTROLLER://:9093
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://localhost:9092,INTERNAL://kafka:29092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,INTERNAL:PLAINTEXT,CONTROLLER:PLAINTEXT
+
       KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
-      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: INTERNAL
+
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
       KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
       KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
       KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
       KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
-      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+
+      CLUSTER_ID: 5L6g3nShT-eMCtK--X86sw
+    volumes:
+      - paycore_kafka_data:/var/lib/kafka/data
 
   mongodb:
     image: mongo:7
@@ -68,6 +81,151 @@ services:
     volumes:
       - paycore_rabbitmq_data:/var/lib/rabbitmq
 
+  merchant-service:
+    build:
+      context: ../backend/merchant-service
+    container_name: paycore-merchant-service
+    restart: always
+    ports:
+      - "8081:8081"
+    environment:
+      SERVER_PORT: 8081
+      SPRING_DATASOURCE_URL: jdbc:postgresql://postgres:5432/paycore_merchant_db
+      SPRING_DATASOURCE_USERNAME: paycore
+      SPRING_DATASOURCE_PASSWORD: paycore
+      SPRING_DATA_REDIS_HOST: redis
+      SPRING_DATA_REDIS_PORT: 6379
+    depends_on:
+      - postgres
+      - redis
+
+  legacy-bank-soap-service:
+    build:
+      context: ../backend/legacy-bank-soap-service
+    container_name: paycore-legacy-bank-soap-service
+    restart: always
+    ports:
+      - "8084:8084"
+
+  fraud-service:
+    build:
+      context: ../backend/fraud-service
+    container_name: paycore-fraud-service
+    restart: always
+    ports:
+      - "8086:8086"
+    environment:
+      SERVER_PORT: 8086
+      SPRING_DATA_MONGODB_HOST: mongodb
+      SPRING_DATA_MONGODB_PORT: 27017
+      SPRING_DATA_MONGODB_DATABASE: paycore_fraud_db
+      SPRING_DATA_MONGODB_USERNAME: paycore
+      SPRING_DATA_MONGODB_PASSWORD: paycore
+      SPRING_DATA_MONGODB_AUTHENTICATION_DATABASE: admin
+    depends_on:
+      - mongodb
+
+  payment-service:
+    build:
+      context: ../backend/payment-service
+    container_name: paycore-payment-service
+    restart: always
+    ports:
+      - "8082:8082"
+    environment:
+      SPRING_DATASOURCE_URL: jdbc:postgresql://postgres:5432/paycore_payment_db
+      SPRING_DATASOURCE_USERNAME: paycore
+      SPRING_DATASOURCE_PASSWORD: paycore
+      SPRING_KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+      SPRING_RABBITMQ_HOST: rabbitmq
+      SPRING_RABBITMQ_PORT: 5672
+      SPRING_RABBITMQ_USERNAME: paycore
+      SPRING_RABBITMQ_PASSWORD: paycore
+      MERCHANT_SERVICE_BASE_URL: http://merchant-service:8081
+      LEGACY_BANK_SOAP_SERVICE_BASE_URL: http://legacy-bank-soap-service:8084/ws
+      FRAUD_SERVICE_BASE_URL: http://fraud-service:8086
+      SERVER_PORT: 8082
+    depends_on:
+      - postgres
+      - kafka
+      - rabbitmq
+      - merchant-service
+      - legacy-bank-soap-service
+      - fraud-service
+
+  ledger-service:
+    build:
+      context: ../backend/ledger-service
+    container_name: paycore-ledger-service
+    restart: always
+    ports:
+      - "8083:8083"
+    environment:
+      SPRING_DATASOURCE_URL: jdbc:postgresql://postgres:5432/paycore_ledger_db
+      SPRING_DATASOURCE_USERNAME: paycore
+      SPRING_DATASOURCE_PASSWORD: paycore
+      SPRING_KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+    depends_on:
+      - postgres
+      - kafka
+
+  settlement-service:
+    build:
+      context: ../backend/settlement-service
+    container_name: paycore-settlement-service
+    restart: always
+    ports:
+      - "8085:8085"
+    environment:
+      SPRING_DATASOURCE_URL: jdbc:postgresql://postgres:5432/paycore_settlement_db
+      SPRING_DATASOURCE_USERNAME: paycore
+      SPRING_DATASOURCE_PASSWORD: paycore
+      SPRING_KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+    depends_on:
+      - postgres
+      - kafka
+
+  notification-service:
+    build:
+      context: ../backend/notification-service
+    container_name: paycore-notification-service
+    restart: always
+    ports:
+      - "8087:8087"
+    environment:
+      SPRING_DATASOURCE_URL: jdbc:postgresql://postgres:5432/paycore_notification_db
+      SPRING_DATASOURCE_USERNAME: paycore
+      SPRING_DATASOURCE_PASSWORD: paycore
+      SPRING_RABBITMQ_HOST: rabbitmq
+      SPRING_RABBITMQ_PORT: 5672
+      SPRING_RABBITMQ_USERNAME: paycore
+      SPRING_RABBITMQ_PASSWORD: paycore
+    depends_on:
+      - postgres
+      - rabbitmq
+
+  api-gateway:
+    build:
+      context: ../backend/api-gateway
+    container_name: paycore-api-gateway
+    restart: always
+    ports:
+      - "8090:8090"
+    environment:
+      MERCHANT_SERVICE_URI: http://merchant-service:8081
+      PAYMENT_SERVICE_URI: http://payment-service:8082
+      LEDGER_SERVICE_URI: http://ledger-service:8083
+      SETTLEMENT_SERVICE_URI: http://settlement-service:8085
+      FRAUD_SERVICE_URI: http://fraud-service:8086
+      NOTIFICATION_SERVICE_URI: http://notification-service:8087
+    depends_on:
+      - merchant-service
+      - payment-service
+      - ledger-service
+      - settlement-service
+      - fraud-service
+      - notification-service
+
   merchant-dashboard:
     build:
       context: ../frontend/merchant-dashboard
@@ -81,6 +239,8 @@ services:
       - paycore_merchant_dashboard_node_modules:/app/node_modules
     environment:
       VITE_API_BASE_URL: http://localhost:8090
+    depends_on:
+      - api-gateway
 
 volumes:
   paycore_postgres_data:
