@@ -1,0 +1,27 @@
+server:
+  port: 8086
+
+spring:
+  application:
+    name: fraud-service
+
+  mongodb:
+    host: localhost
+    port: 27017
+    database: paycore_fraud_db
+    username: paycore
+    password: paycore
+    authentication-database: admin
+    uuid-representation: standard
+
+paycore:
+  fraud:
+    high-amount-threshold: 50000
+    card-attempt-threshold: 3
+    ip-attempt-threshold: 5
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info

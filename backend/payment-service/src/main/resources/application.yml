@@ -1,0 +1,55 @@
+server:
+  port: 8082
+
+spring:
+  application:
+    name: payment-service
+
+  datasource:
+    url: jdbc:postgresql://localhost:5432/paycore_payment_db
+    username: paycore
+    password: paycore
+    driver-class-name: org.postgresql.Driver
+
+  kafka:
+    bootstrap-servers: localhost:9092
+    producer:
+      key-serializer: org.apache.kafka.common.serialization.StringSerializer
+      value-serializer: org.springframework.kafka.support.serializer.JsonSerializer
+
+  jpa:
+    hibernate:
+      ddl-auto: update
+    show-sql: true
+    properties:
+      hibernate:
+        format_sql: true
+
+  rabbitmq:
+    host: localhost
+    port: 5672
+    username: paycore
+    password: paycore
+
+services:
+  merchant-service:
+    base-url: http://localhost:8081
+  legacy-bank-soap-service:
+    base-url: http://localhost:8084/ws
+  fraud-service:
+    base-url: http://localhost:8086
+
+paycore:
+  kafka:
+    topics:
+      payment-events: payment-events
+  rabbitmq:
+    exchange: notification.exchange
+    payment-notification-queue: payment.notification.queue
+    payment-notification-routing-key: payment.notification.created
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info

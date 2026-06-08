@@ -1,0 +1,38 @@
+server:
+  port: 8087
+
+spring:
+  application:
+    name: notification-service
+
+  datasource:
+    url: jdbc:postgresql://localhost:5432/paycore_notification_db
+    username: paycore
+    password: paycore
+    driver-class-name: org.postgresql.Driver
+
+  rabbitmq:
+    host: localhost
+    port: 5672
+    username: paycore
+    password: paycore
+
+  jpa:
+    hibernate:
+      ddl-auto: update
+    show-sql: true
+    properties:
+      hibernate:
+        format_sql: true
+
+paycore:
+  rabbitmq:
+    exchange: notification.exchange
+    payment-notification-queue: payment.notification.queue
+    payment-notification-routing-key: payment.notification.created
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info

@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema"
+           targetNamespace="http://paycore.com/legacy-bank"
+           xmlns:tns="http://paycore.com/legacy-bank"
+           elementFormDefault="qualified">
+
+    <xs:element name="authorizePaymentRequest">
+        <xs:complexType>
+            <xs:sequence>
+                <xs:element name="merchantId" type="xs:string"/>
+                <xs:element name="amount" type="xs:decimal"/>
+                <xs:element name="currency" type="xs:string"/>
+                <xs:element name="orderId" type="xs:string"/>
+                <xs:element name="cardToken" type="xs:string"/>
+            </xs:sequence>
+        </xs:complexType>
+    </xs:element>
+
+    <xs:element name="authorizePaymentResponse">
+        <xs:complexType>
+            <xs:sequence>
+                <xs:element name="approved" type="xs:boolean"/>
+                <xs:element name="bankReferenceId" type="xs:string" minOccurs="0"/>
+                <xs:element name="responseCode" type="xs:string"/>
+                <xs:element name="responseMessage" type="xs:string"/>
+            </xs:sequence>
+        </xs:complexType>
+    </xs:element>
+
+</xs:schema>
