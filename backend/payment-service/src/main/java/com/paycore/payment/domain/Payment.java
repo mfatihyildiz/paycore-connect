@@ -8,7 +8,17 @@ import java.time.LocalDateTime;
 import java.util.UUID;
 
 @Entity
-@Table(name = "payments")
+@Table(
+        name = "payments",
+        uniqueConstraints = @UniqueConstraint(
+                name = "uk_payments_merchant_order",
+                columnNames = {"merchant_id", "order_id"}
+        ),
+        indexes = @Index(
+                name = "idx_payments_merchant_created_at",
+                columnList = "merchant_id, created_at"
+        )
+)
 @Getter
 @Setter
 @NoArgsConstructor
