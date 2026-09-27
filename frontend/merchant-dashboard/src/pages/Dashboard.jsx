@@ -60,6 +60,7 @@ function Dashboard() {
                     headers: {
                         "X-API-Key": apiKey,
                         "X-Forwarded-For": ipAddress,
+                        "Idempotency-Key": crypto.randomUUID(),
                     },
                 }
             );

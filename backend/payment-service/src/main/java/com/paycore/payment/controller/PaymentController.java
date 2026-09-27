@@ -22,10 +22,17 @@ public class PaymentController {
     @ResponseStatus(HttpStatus.CREATED)
     public PaymentResponse initiatePayment(
             @RequestHeader("X-API-Key") String apiKey,
-            @RequestHeader(value = "X-Forwarded-For", required = false) String forwardedFor,
+            @RequestHeader("Idempotency-Key") String idempotencyKey,
+            @RequestHeader(value = "X-Forwarded-For", required = false)
+            String forwardedFor,
             @Valid @RequestBody PaymentInitiateRequest request
     ) {
-        return paymentService.initiatePayment(apiKey, extractClientIp(forwardedFor), request);
+        return paymentService.initiatePayment(
+                apiKey,
+                idempotencyKey,
+                extractClientIp(forwardedFor),
+                request
+        );
     }
 
     private String extractClientIp(String forwardedFor) {

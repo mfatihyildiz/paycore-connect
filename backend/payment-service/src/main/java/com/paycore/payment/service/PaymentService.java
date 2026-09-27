@@ -1,27 +1,32 @@
 package com.paycore.payment.service;
 
+import com.paycore.payment.client.FraudClient;
 import com.paycore.payment.client.MerchantClient;
+import com.paycore.payment.domain.IdempotencyOperation;
+import com.paycore.payment.domain.IdempotencyRecord;
+import com.paycore.payment.domain.IdempotencyStatus;
 import com.paycore.payment.domain.Payment;
 import com.paycore.payment.domain.PaymentStatus;
+import com.paycore.payment.dto.FraudCheckRequest;
+import com.paycore.payment.dto.FraudCheckResponse;
 import com.paycore.payment.dto.MerchantValidationResponse;
 import com.paycore.payment.dto.PaymentInitiateRequest;
 import com.paycore.payment.dto.PaymentResponse;
+import com.paycore.payment.event.PaymentEventProducer;
 import com.paycore.payment.exception.DuplicateOrderException;
 import com.paycore.payment.exception.InvalidMerchantApiKeyException;
 import com.paycore.payment.exception.PaymentNotFoundException;
+import com.paycore.payment.idempotency.PaymentRequestFingerprint;
+import com.paycore.payment.notification.PaymentNotificationProducer;
 import com.paycore.payment.provider.PaymentProviderClient;
 import com.paycore.payment.provider.PaymentProviderFactory;
 import com.paycore.payment.provider.ProviderPaymentRequest;
 import com.paycore.payment.provider.ProviderPaymentResponse;
 import com.paycore.payment.repository.PaymentRepository;
 import lombok.RequiredArgsConstructor;
+import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
-import com.paycore.payment.event.PaymentEventProducer;
-import com.paycore.payment.client.FraudClient;
-import com.paycore.payment.dto.FraudCheckRequest;
-import com.paycore.payment.dto.FraudCheckResponse;
-import com.paycore.payment.notification.PaymentNotificationProducer;
 
 import java.util.List;
 import java.util.UUID;
@@ -37,13 +42,48 @@ public class PaymentService {
     private final FraudClient fraudClient;
     private final PaymentNotificationProducer paymentNotificationProducer;
 
-    @Transactional
-    public PaymentResponse initiatePayment(String apiKey, String ipAddress, PaymentInitiateRequest request) {
+    private final PaymentIdempotencyService paymentIdempotencyService;
+    private final PaymentRequestFingerprint paymentRequestFingerprint;
+
+    public PaymentResponse initiatePayment(
+            String apiKey,
+            String idempotencyKey,
+            String ipAddress,
+            PaymentInitiateRequest request
+    ) {
+        paymentIdempotencyService.validateKey(idempotencyKey);
+
         MerchantValidationResponse merchant = merchantClient.validateApiKey(apiKey);
 
         if (merchant == null || !merchant.valid() || merchant.merchantId() == null) {
             throw new InvalidMerchantApiKeyException();
         }
+
+        String requestHash = paymentRequestFingerprint.calculate(request);
+
+        IdempotencyRecord idempotencyRecord =
+                paymentIdempotencyService.acquire(
+                        merchant.merchantId(),
+                        IdempotencyOperation.PAYMENT_INITIATION,
+                        idempotencyKey,
+                        requestHash
+                );
+
+        if (idempotencyRecord.getStatus() == IdempotencyStatus.COMPLETED) {
+            return paymentIdempotencyService.replay(idempotencyRecord);
+        }
+
+        try {
+            PaymentResponse response = processPayment(merchant, ipAddress, request);
+            paymentIdempotencyService.complete(idempotencyRecord.getId(), response);
+            return response;
+        } catch (DuplicateOrderException exception) {
+            paymentIdempotencyService.release(idempotencyRecord.getId());
+            throw exception;
+        }
+    }
+
+    private PaymentResponse processPayment(MerchantValidationResponse merchant, String ipAddress, PaymentInitiateRequest request) {
 
         if (paymentRepository.existsByMerchantIdAndOrderId(merchant.merchantId(), request.orderId())) {
             throw new DuplicateOrderException(merchant.merchantId(), request.orderId());
@@ -59,7 +99,13 @@ public class PaymentService {
                 .cardLastFourDigits(extractCardLastFourDigits(request.cardToken()))
                 .build();
 
-        Payment savedInitiatedPayment = paymentRepository.save(initiatedPayment);
+        Payment savedInitiatedPayment;
+
+        try {
+            savedInitiatedPayment = paymentRepository.save(initiatedPayment);
+        } catch (DataIntegrityViolationException exception) {
+            throw new DuplicateOrderException(merchant.merchantId(), request.orderId());
+        }
 
         paymentEventProducer.publishPaymentEvent(savedInitiatedPayment);
 
@@ -125,7 +171,8 @@ public class PaymentService {
 
     @Transactional(readOnly = true)
     public List<PaymentResponse> getPaymentsByMerchantId(UUID merchantId) {
-        return paymentRepository.findByMerchantIdOrderByCreatedAtDesc(merchantId)
+        return paymentRepository
+                .findByMerchantIdOrderByCreatedAtDesc(merchantId)
                 .stream()
                 .map(this::toResponse)
                 .toList();

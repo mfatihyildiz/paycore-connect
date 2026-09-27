@@ -9,6 +9,9 @@ import com.paycore.payment.dto.PaymentInitiateRequest;
 import com.paycore.payment.dto.PaymentResponse;
 import com.paycore.payment.exception.DuplicateOrderException;
 import com.paycore.payment.exception.GlobalExceptionHandler;
+import com.paycore.payment.exception.IdempotencyKeyReuseException;
+import com.paycore.payment.exception.IdempotencyRequestInProgressException;
+import com.paycore.payment.exception.InvalidIdempotencyKeyException;
 import com.paycore.payment.exception.InvalidMerchantApiKeyException;
 import com.paycore.payment.exception.PaymentNotFoundException;
 import com.paycore.payment.service.PaymentService;
@@ -33,6 +36,9 @@ import static org.springframework.test.web.servlet.request.MockMvcRequestBuilder
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.*;
 
 class PaymentControllerTest {
+
+    private static final String API_KEY = "pk_live_valid_key";
+    private static final String IDEMPOTENCY_KEY = "payment-test-key-001";
 
     private MockMvc mockMvc;
     private ObjectMapper objectMapper;
@@ -86,11 +92,13 @@ class PaymentControllerTest {
         when(paymentService.initiatePayment(
                 anyString(),
                 anyString(),
+                anyString(),
                 any(PaymentInitiateRequest.class)
         )).thenReturn(response);
 
         mockMvc.perform(post("/api/payments/initiate")
-                        .header("X-API-Key", "pk_live_valid_key")
+                        .header("X-API-Key", API_KEY)
+                        .header("Idempotency-Key", IDEMPOTENCY_KEY)
                         .header("X-Forwarded-For", "192.168.1.10, 10.0.0.1")
                         .contentType(MediaType.APPLICATION_JSON)
                         .content(objectMapper.writeValueAsString(request)))
@@ -111,9 +119,7 @@ class PaymentControllerTest {
                 ArgumentCaptor.forClass(PaymentInitiateRequest.class);
 
         verify(paymentService).initiatePayment(
-                eq("pk_live_valid_key"),
-                eq("192.168.1.10"),
-                requestCaptor.capture()
+                eq(API_KEY), eq(IDEMPOTENCY_KEY), eq("192.168.1.10"), requestCaptor.capture()
         );
 
         PaymentInitiateRequest capturedRequest = requestCaptor.getValue();
@@ -155,11 +161,13 @@ class PaymentControllerTest {
         when(paymentService.initiatePayment(
                 anyString(),
                 anyString(),
+                anyString(),
                 any(PaymentInitiateRequest.class)
         )).thenReturn(response);
 
         mockMvc.perform(post("/api/payments/initiate")
-                        .header("X-API-Key", "pk_live_valid_key")
+                        .header("X-API-Key", API_KEY)
+                        .header("Idempotency-Key", IDEMPOTENCY_KEY)
                         .contentType(MediaType.APPLICATION_JSON)
                         .content(objectMapper.writeValueAsString(request)))
                 .andExpect(status().isCreated())
@@ -167,9 +175,7 @@ class PaymentControllerTest {
                 .andExpect(jsonPath("$.status").value("AUTHORIZED"));
 
         verify(paymentService).initiatePayment(
-                eq("pk_live_valid_key"),
-                eq("unknown"),
-                any(PaymentInitiateRequest.class)
+                eq(API_KEY), eq(IDEMPOTENCY_KEY), eq("unknown"), any(PaymentInitiateRequest.class)
         );
     }
 
@@ -184,14 +190,34 @@ class PaymentControllerTest {
         );
 
         mockMvc.perform(post("/api/payments/initiate")
+                        .header("Idempotency-Key", IDEMPOTENCY_KEY)
                         .contentType(MediaType.APPLICATION_JSON)
                         .content(objectMapper.writeValueAsString(request)))
                 .andExpect(status().isBadRequest());
 
         verify(paymentService, never()).initiatePayment(
-                anyString(),
-                anyString(),
-                any(PaymentInitiateRequest.class)
+                anyString(), anyString(), anyString(), any(PaymentInitiateRequest.class)
+        );
+    }
+
+    @Test
+    void initiatePayment_shouldReturnBadRequest_whenIdempotencyKeyHeaderIsMissing() throws Exception {
+        PaymentInitiateRequest request = new PaymentInitiateRequest(
+                new BigDecimal("1000.00"),
+                "TRY",
+                "ORDER-MISSING-IDEMPOTENCY-KEY-1001",
+                "card_token_1234567890123456",
+                PaymentProviderType.MOCK_BANK
+        );
+
+        mockMvc.perform(post("/api/payments/initiate")
+                        .header("X-API-Key", API_KEY)
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(objectMapper.writeValueAsString(request)))
+                .andExpect(status().isBadRequest());
+
+        verify(paymentService, never()).initiatePayment(
+                anyString(), anyString(), anyString(), any(PaymentInitiateRequest.class)
         );
     }
 
@@ -208,7 +234,8 @@ class PaymentControllerTest {
                 """;
 
         mockMvc.perform(post("/api/payments/initiate")
-                        .header("X-API-Key", "pk_live_valid_key")
+                        .header("X-API-Key", API_KEY)
+                        .header("Idempotency-Key", IDEMPOTENCY_KEY)
                         .contentType(MediaType.APPLICATION_JSON)
                         .content(invalidRequestBody))
                 .andExpect(status().isBadRequest())
@@ -222,9 +249,7 @@ class PaymentControllerTest {
                 .andExpect(jsonPath("$.validationErrors.providerType").exists());
 
         verify(paymentService, never()).initiatePayment(
-                anyString(),
-                anyString(),
-                any(PaymentInitiateRequest.class)
+                anyString(), anyString(), anyString(), any(PaymentInitiateRequest.class)
         );
     }
 
@@ -241,11 +266,13 @@ class PaymentControllerTest {
         when(paymentService.initiatePayment(
                 anyString(),
                 anyString(),
+                anyString(),
                 any(PaymentInitiateRequest.class)
         )).thenThrow(new InvalidMerchantApiKeyException());
 
         mockMvc.perform(post("/api/payments/initiate")
                         .header("X-API-Key", "invalid-api-key")
+                        .header("Idempotency-Key", IDEMPOTENCY_KEY)
                         .contentType(MediaType.APPLICATION_JSON)
                         .content(objectMapper.writeValueAsString(request)))
                 .andExpect(status().isUnauthorized())
@@ -254,8 +281,7 @@ class PaymentControllerTest {
                 .andExpect(jsonPath("$.message").value("Invalid or inactive merchant API key"));
 
         verify(paymentService).initiatePayment(
-                eq("invalid-api-key"),
-                eq("unknown"),
+                eq("invalid-api-key"), eq(IDEMPOTENCY_KEY), eq("unknown"),
                 any(PaymentInitiateRequest.class)
         );
     }
@@ -273,13 +299,12 @@ class PaymentControllerTest {
         );
 
         when(paymentService.initiatePayment(
-                anyString(),
-                anyString(),
-                any(PaymentInitiateRequest.class)
+                anyString(), anyString(), anyString(), any(PaymentInitiateRequest.class)
         )).thenThrow(new DuplicateOrderException(merchantId, "ORDER-DUPLICATE-1001"));
 
         mockMvc.perform(post("/api/payments/initiate")
-                        .header("X-API-Key", "pk_live_valid_key")
+                        .header("X-API-Key", API_KEY)
+                        .header("Idempotency-Key", IDEMPOTENCY_KEY)
                         .contentType(MediaType.APPLICATION_JSON)
                         .content(objectMapper.writeValueAsString(request)))
                 .andExpect(status().isConflict())
@@ -292,8 +317,108 @@ class PaymentControllerTest {
                 ));
 
         verify(paymentService).initiatePayment(
-                eq("pk_live_valid_key"),
-                eq("unknown"),
+                eq(API_KEY), eq(IDEMPOTENCY_KEY), eq("unknown"),
+                any(PaymentInitiateRequest.class)
+        );
+    }
+
+    @Test
+    void initiatePayment_shouldReturnBadRequest_whenIdempotencyKeyIsInvalid() throws Exception {
+        PaymentInitiateRequest request = new PaymentInitiateRequest(
+                new BigDecimal("1000.00"),
+                "TRY",
+                "ORDER-INVALID-IDEMPOTENCY-1001",
+                "card_token_1234567890123456",
+                PaymentProviderType.MOCK_BANK
+        );
+
+        when(paymentService.initiatePayment(
+                anyString(), anyString(), anyString(), any(PaymentInitiateRequest.class)
+        )).thenThrow(new InvalidIdempotencyKeyException(
+                "Idempotency-Key must not be blank"
+        ));
+
+        mockMvc.perform(post("/api/payments/initiate")
+                        .header("X-API-Key", API_KEY)
+                        .header("Idempotency-Key", "invalid-key")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(objectMapper.writeValueAsString(request)))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.status").value(400))
+                .andExpect(jsonPath("$.error").value("Bad Request"))
+                .andExpect(jsonPath("$.message").value(
+                        "Idempotency-Key must not be blank"
+                ));
+    }
+
+    @Test
+    void initiatePayment_shouldReturnConflict_whenIdempotencyKeyIsReusedWithDifferentRequest() throws Exception {
+
+        PaymentInitiateRequest request = new PaymentInitiateRequest(
+                new BigDecimal("1000.00"),
+                "TRY",
+                "ORDER-IDEMPOTENCY-REUSE-1001",
+                "card_token_1234567890123456",
+                PaymentProviderType.MOCK_BANK
+        );
+
+        when(paymentService.initiatePayment(
+                anyString(),
+                anyString(),
+                anyString(),
+                any(PaymentInitiateRequest.class)
+        )).thenThrow(new IdempotencyKeyReuseException());
+
+        mockMvc.perform(post("/api/payments/initiate")
+                        .header("X-API-Key", API_KEY)
+                        .header("Idempotency-Key", IDEMPOTENCY_KEY)
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(objectMapper.writeValueAsString(request)))
+                .andExpect(status().isConflict())
+                .andExpect(jsonPath("$.status").value(409))
+                .andExpect(jsonPath("$.error").value("Conflict"))
+                .andExpect(jsonPath("$.message").value(
+                        "Idempotency key has already been used with different request parameters"
+                ));
+
+        verify(paymentService).initiatePayment(
+                eq(API_KEY), eq(IDEMPOTENCY_KEY), eq("unknown"),
+                any(PaymentInitiateRequest.class)
+        );
+    }
+
+    @Test
+    void initiatePayment_shouldReturnConflict_whenIdempotentRequestIsStillProcessing() throws Exception {
+
+        PaymentInitiateRequest request = new PaymentInitiateRequest(
+                new BigDecimal("1000.00"),
+                "TRY",
+                "ORDER-IDEMPOTENCY-PROCESSING-1001",
+                "card_token_1234567890123456",
+                PaymentProviderType.MOCK_BANK
+        );
+
+        when(paymentService.initiatePayment(
+                anyString(),
+                anyString(),
+                anyString(),
+                any(PaymentInitiateRequest.class)
+        )).thenThrow(new IdempotencyRequestInProgressException());
+
+        mockMvc.perform(post("/api/payments/initiate")
+                        .header("X-API-Key", API_KEY)
+                        .header("Idempotency-Key", IDEMPOTENCY_KEY)
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(objectMapper.writeValueAsString(request)))
+                .andExpect(status().isConflict())
+                .andExpect(jsonPath("$.status").value(409))
+                .andExpect(jsonPath("$.error").value("Conflict"))
+                .andExpect(jsonPath("$.message").value(
+                        "A request with this idempotency key is already being processed"
+                ));
+
+        verify(paymentService).initiatePayment(
+                eq(API_KEY), eq(IDEMPOTENCY_KEY), eq("unknown"),
                 any(PaymentInitiateRequest.class)
         );
     }

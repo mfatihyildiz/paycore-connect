@@ -2,6 +2,9 @@ package com.paycore.payment.service;
 
 import com.paycore.payment.client.FraudClient;
 import com.paycore.payment.client.MerchantClient;
+import com.paycore.payment.domain.IdempotencyOperation;
+import com.paycore.payment.domain.IdempotencyRecord;
+import com.paycore.payment.domain.IdempotencyStatus;
 import com.paycore.payment.domain.Payment;
 import com.paycore.payment.domain.PaymentProviderType;
 import com.paycore.payment.domain.PaymentStatus;
@@ -12,8 +15,10 @@ import com.paycore.payment.dto.PaymentInitiateRequest;
 import com.paycore.payment.dto.PaymentResponse;
 import com.paycore.payment.event.PaymentEventProducer;
 import com.paycore.payment.exception.DuplicateOrderException;
+import com.paycore.payment.exception.InvalidIdempotencyKeyException;
 import com.paycore.payment.exception.InvalidMerchantApiKeyException;
 import com.paycore.payment.exception.PaymentNotFoundException;
+import com.paycore.payment.idempotency.PaymentRequestFingerprint;
 import com.paycore.payment.notification.PaymentNotificationProducer;
 import com.paycore.payment.provider.PaymentProviderClient;
 import com.paycore.payment.provider.PaymentProviderFactory;
@@ -36,11 +41,15 @@ import java.util.UUID;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
-import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.*;
 import static org.mockito.Mockito.*;
 
 @ExtendWith(MockitoExtension.class)
 class PaymentServiceTest {
+
+    private static final String VALID_API_KEY = "valid-api-key";
+    private static final String IDEMPOTENCY_KEY = "payment-test-key-001";
+    private static final String CLIENT_IP = "192.168.1.10";
 
     @Mock
     private PaymentRepository paymentRepository;
@@ -63,6 +72,12 @@ class PaymentServiceTest {
     @Mock
     private PaymentProviderClient paymentProviderClient;
 
+    @Mock
+    private PaymentIdempotencyService paymentIdempotencyService;
+
+    @Mock
+    private PaymentRequestFingerprint paymentRequestFingerprint;
+
     private PaymentService paymentService;
 
     @BeforeEach
@@ -73,7 +88,9 @@ class PaymentServiceTest {
                 paymentProviderFactory,
                 paymentEventProducer,
                 fraudClient,
-                paymentNotificationProducer
+                paymentNotificationProducer,
+                paymentIdempotencyService,
+                paymentRequestFingerprint
         );
     }
 
@@ -89,31 +106,17 @@ class PaymentServiceTest {
                 PaymentProviderType.MOCK_BANK
         );
 
-        MerchantValidationResponse merchantResponse = new MerchantValidationResponse(
-                true,
-                merchantId,
-                "Test Merchant",
-                "ACTIVE"
-        );
+        MerchantValidationResponse merchantResponse = new MerchantValidationResponse(true, merchantId, "Test Merchant", "ACTIVE");
 
-        FraudCheckResponse fraudResponse = createFraudCheckResponse(
-                merchantId,
-                "APPROVED",
-                "LOW",
-                0,
-                "Payment risk is acceptable"
-        );
+        FraudCheckResponse fraudResponse = createFraudCheckResponse(merchantId, "APPROVED", "LOW", 0, "Payment risk is acceptable");
 
-        ProviderPaymentResponse providerResponse = new ProviderPaymentResponse(
-                true,
-                "MOCK-BANK-REF-1001",
-                "00",
-                "APPROVED"
-        );
+        ProviderPaymentResponse providerResponse = new ProviderPaymentResponse(true, "MOCK-BANK-REF-1001", "00", "APPROVED");
+
+        IdempotencyRecord idempotencyRecord = stubProcessingIdempotency(merchantId, request, IDEMPOTENCY_KEY);
 
         List<PaymentStatus> publishedStatuses = new ArrayList<>();
 
-        when(merchantClient.validateApiKey("valid-api-key")).thenReturn(merchantResponse);
+        when(merchantClient.validateApiKey(VALID_API_KEY)).thenReturn(merchantResponse);
         when(paymentRepository.existsByMerchantIdAndOrderId(merchantId, request.orderId())).thenReturn(false);
         when(paymentRepository.save(any(Payment.class))).thenAnswer(invocation -> persistLikeJpa(invocation.getArgument(0)));
         when(fraudClient.checkPaymentRisk(any(FraudCheckRequest.class))).thenReturn(fraudResponse);
@@ -126,11 +129,7 @@ class PaymentServiceTest {
             return null;
         }).when(paymentEventProducer).publishPaymentEvent(any(Payment.class));
 
-        PaymentResponse response = paymentService.initiatePayment(
-                "valid-api-key",
-                "192.168.1.10",
-                request
-        );
+        PaymentResponse response = paymentService.initiatePayment(VALID_API_KEY, IDEMPOTENCY_KEY, CLIENT_IP, request);
 
         assertThat(response).isNotNull();
         assertThat(response.id()).isNotNull();
@@ -145,10 +144,10 @@ class PaymentServiceTest {
         assertThat(response.providerResponseMessage()).isEqualTo("APPROVED");
         assertThat(response.cardLastFourDigits()).isEqualTo("3456");
 
-        assertThat(publishedStatuses).containsExactly(
-                PaymentStatus.INITIATED,
-                PaymentStatus.AUTHORIZED
-        );
+        assertThat(publishedStatuses).containsExactly(PaymentStatus.INITIATED, PaymentStatus.AUTHORIZED);
+
+        verify(paymentIdempotencyService).validateKey(IDEMPOTENCY_KEY);
+        verify(paymentIdempotencyService).complete(idempotencyRecord.getId(), response);
 
         verify(paymentRepository, times(2)).save(any(Payment.class));
         verify(paymentEventProducer, times(2)).publishPaymentEvent(any(Payment.class));
@@ -167,7 +166,7 @@ class PaymentServiceTest {
         assertThat(capturedFraudRequest.currency()).isEqualTo("TRY");
         assertThat(capturedFraudRequest.orderId()).isEqualTo("ORDER-PAYMENT-1001");
         assertThat(capturedFraudRequest.cardToken()).isEqualTo("card_token_1234567890123456");
-        assertThat(capturedFraudRequest.ipAddress()).isEqualTo("192.168.1.10");
+        assertThat(capturedFraudRequest.ipAddress()).isEqualTo(CLIENT_IP);
 
         ArgumentCaptor<ProviderPaymentRequest> providerRequestCaptor =
                 ArgumentCaptor.forClass(ProviderPaymentRequest.class);
@@ -184,6 +183,98 @@ class PaymentServiceTest {
     }
 
     @Test
+    void initiatePayment_shouldReplayPreviousResponse_whenIdempotentRequestWasAlreadyCompleted() {
+        UUID merchantId = UUID.randomUUID();
+        UUID paymentId = UUID.randomUUID();
+
+        PaymentInitiateRequest request = createPaymentInitiateRequest(
+                new BigDecimal("1000.00"),
+                "TRY",
+                "ORDER-IDEMPOTENT-REPLAY-1001",
+                "card_token_1234567890123456",
+                PaymentProviderType.MOCK_BANK
+        );
+
+        MerchantValidationResponse merchantResponse = new MerchantValidationResponse(true, merchantId, "Test Merchant", "ACTIVE");
+
+        String requestHash = "completed-request-hash";
+
+        IdempotencyRecord completedRecord = IdempotencyRecord.builder()
+                .id(UUID.randomUUID())
+                .merchantId(merchantId)
+                .operation(IdempotencyOperation.PAYMENT_INITIATION)
+                .idempotencyKey(IDEMPOTENCY_KEY)
+                .requestHash(requestHash)
+                .status(IdempotencyStatus.COMPLETED)
+                .createdAt(LocalDateTime.now())
+                .completedAt(LocalDateTime.now())
+                .build();
+
+        PaymentResponse previousResponse = new PaymentResponse(
+                paymentId,
+                merchantId,
+                new BigDecimal("1000.00"),
+                "TRY",
+                "ORDER-IDEMPOTENT-REPLAY-1001",
+                PaymentStatus.AUTHORIZED,
+                PaymentProviderType.MOCK_BANK,
+                "MOCK-BANK-REF-REPLAY",
+                "00",
+                "APPROVED",
+                "3456",
+                LocalDateTime.now(),
+                LocalDateTime.now()
+        );
+
+        when(merchantClient.validateApiKey(VALID_API_KEY)).thenReturn(merchantResponse);
+        when(paymentRequestFingerprint.calculate(request)).thenReturn(requestHash);
+        when(paymentIdempotencyService.acquire(
+                merchantId, IdempotencyOperation.PAYMENT_INITIATION, IDEMPOTENCY_KEY, requestHash
+        )).thenReturn(completedRecord);
+        when(paymentIdempotencyService.replay(completedRecord)).thenReturn(previousResponse);
+
+        PaymentResponse response = paymentService.initiatePayment(VALID_API_KEY, IDEMPOTENCY_KEY, CLIENT_IP, request);
+
+        assertThat(response).isSameAs(previousResponse);
+        assertThat(response.id()).isEqualTo(paymentId);
+
+        verify(paymentIdempotencyService).replay(completedRecord);
+        verify(paymentIdempotencyService, never()).complete(any(), any());
+
+        verify(paymentRepository, never()).existsByMerchantIdAndOrderId(any(), anyString());
+        verify(paymentRepository, never()).save(any(Payment.class));
+        verify(fraudClient, never()).checkPaymentRisk(any(FraudCheckRequest.class));
+        verify(paymentProviderFactory, never()).getClient(any(PaymentProviderType.class));
+        verify(paymentProviderClient, never()).authorize(any(ProviderPaymentRequest.class));
+        verify(paymentEventProducer, never()).publishPaymentEvent(any(Payment.class));
+        verify(paymentNotificationProducer, never()).publishPaymentNotification(any(Payment.class), anyString());
+    }
+
+    @Test
+    void initiatePayment_shouldThrowInvalidIdempotencyKeyException_beforeMerchantValidation() {
+        PaymentInitiateRequest request = createPaymentInitiateRequest(
+                new BigDecimal("1000.00"),
+                "TRY",
+                "ORDER-INVALID-IDEMPOTENCY-1001",
+                "card_token_1234567890123456",
+                PaymentProviderType.MOCK_BANK
+        );
+
+        doThrow(new InvalidIdempotencyKeyException("Idempotency-Key must not be blank"))
+                .when(paymentIdempotencyService)
+                .validateKey("");
+
+        assertThatThrownBy(() ->
+                paymentService.initiatePayment(VALID_API_KEY, "", CLIENT_IP, request)
+        ).isInstanceOf(InvalidIdempotencyKeyException.class);
+
+        verify(merchantClient, never()).validateApiKey(anyString());
+        verify(paymentRequestFingerprint, never()).calculate(any());
+        verify(paymentIdempotencyService, never()).acquire(any(), any(), anyString(), anyString());
+        verify(paymentRepository, never()).save(any(Payment.class));
+    }
+
+    @Test
     void initiatePayment_shouldThrowInvalidMerchantApiKeyException_whenMerchantValidationReturnsNull() {
         PaymentInitiateRequest request = createPaymentInitiateRequest(
                 new BigDecimal("1000.00"),
@@ -196,10 +287,12 @@ class PaymentServiceTest {
         when(merchantClient.validateApiKey("invalid-api-key")).thenReturn(null);
 
         assertThatThrownBy(() -> paymentService.initiatePayment(
-                "invalid-api-key",
-                "192.168.1.10",
-                request
-        )).isInstanceOf(InvalidMerchantApiKeyException.class);
+                "invalid-api-key", IDEMPOTENCY_KEY, CLIENT_IP, request)
+        ).isInstanceOf(InvalidMerchantApiKeyException.class);
+
+        verify(paymentIdempotencyService).validateKey(IDEMPOTENCY_KEY);
+        verify(paymentRequestFingerprint, never()).calculate(any());
+        verify(paymentIdempotencyService, never()).acquire(any(), any(), anyString(), anyString());
 
         verify(paymentRepository, never()).save(any(Payment.class));
         verify(fraudClient, never()).checkPaymentRisk(any(FraudCheckRequest.class));
@@ -218,20 +311,16 @@ class PaymentServiceTest {
                 PaymentProviderType.MOCK_BANK
         );
 
-        MerchantValidationResponse merchantResponse = new MerchantValidationResponse(
-                false,
-                null,
-                null,
-                null
-        );
+        MerchantValidationResponse merchantResponse = new MerchantValidationResponse(false, null, null, null);
 
         when(merchantClient.validateApiKey("invalid-api-key")).thenReturn(merchantResponse);
 
         assertThatThrownBy(() -> paymentService.initiatePayment(
-                "invalid-api-key",
-                "192.168.1.10",
-                request
-        )).isInstanceOf(InvalidMerchantApiKeyException.class);
+                "invalid-api-key", IDEMPOTENCY_KEY, CLIENT_IP, request)
+        ).isInstanceOf(InvalidMerchantApiKeyException.class);
+
+        verify(paymentRequestFingerprint, never()).calculate(any());
+        verify(paymentIdempotencyService, never()).acquire(any(), any(), anyString(), anyString());
 
         verify(paymentRepository, never()).save(any(Payment.class));
         verify(fraudClient, never()).checkPaymentRisk(any(FraudCheckRequest.class));
@@ -239,7 +328,7 @@ class PaymentServiceTest {
     }
 
     @Test
-    void initiatePayment_shouldThrowDuplicateOrderException_whenOrderAlreadyExistsForMerchant() {
+    void initiatePayment_shouldThrowDuplicateOrderExceptionAndReleaseIdempotency_whenOrderAlreadyExistsForMerchant() {
         UUID merchantId = UUID.randomUUID();
 
         PaymentInitiateRequest request = createPaymentInitiateRequest(
@@ -250,23 +339,23 @@ class PaymentServiceTest {
                 PaymentProviderType.MOCK_BANK
         );
 
-        MerchantValidationResponse merchantResponse = new MerchantValidationResponse(
-                true,
-                merchantId,
-                "Test Merchant",
-                "ACTIVE"
-        );
+        MerchantValidationResponse merchantResponse =
+                new MerchantValidationResponse(true, merchantId, "Test Merchant", "ACTIVE");
 
-        when(merchantClient.validateApiKey("valid-api-key")).thenReturn(merchantResponse);
+        IdempotencyRecord idempotencyRecord = stubProcessingIdempotency(merchantId, request, IDEMPOTENCY_KEY);
+
+        when(merchantClient.validateApiKey(VALID_API_KEY)).thenReturn(merchantResponse);
         when(paymentRepository.existsByMerchantIdAndOrderId(merchantId, request.orderId())).thenReturn(true);
 
         assertThatThrownBy(() -> paymentService.initiatePayment(
-                "valid-api-key",
-                "192.168.1.10",
-                request
-        )).isInstanceOf(DuplicateOrderException.class);
+                VALID_API_KEY, IDEMPOTENCY_KEY, CLIENT_IP, request)
+        ).isInstanceOf(DuplicateOrderException.class);
 
         verify(paymentRepository).existsByMerchantIdAndOrderId(merchantId, request.orderId());
+
+        verify(paymentIdempotencyService).release(idempotencyRecord.getId());
+        verify(paymentIdempotencyService, never()).complete(any(), any());
+
         verify(paymentRepository, never()).save(any(Payment.class));
         verify(fraudClient, never()).checkPaymentRisk(any(FraudCheckRequest.class));
         verify(paymentProviderFactory, never()).getClient(any(PaymentProviderType.class));
@@ -284,12 +373,8 @@ class PaymentServiceTest {
                 PaymentProviderType.MOCK_BANK
         );
 
-        MerchantValidationResponse merchantResponse = new MerchantValidationResponse(
-                true,
-                merchantId,
-                "Fraud Test Merchant",
-                "ACTIVE"
-        );
+        MerchantValidationResponse merchantResponse =
+                new MerchantValidationResponse(true, merchantId, "Fraud Test Merchant", "ACTIVE");
 
         FraudCheckResponse fraudResponse = createFraudCheckResponse(
                 merchantId,
@@ -299,11 +384,14 @@ class PaymentServiceTest {
                 "Payment rejected due to high fraud risk"
         );
 
+        IdempotencyRecord idempotencyRecord = stubProcessingIdempotency(merchantId, request, IDEMPOTENCY_KEY);
+
         List<PaymentStatus> publishedStatuses = new ArrayList<>();
 
-        when(merchantClient.validateApiKey("valid-api-key")).thenReturn(merchantResponse);
+        when(merchantClient.validateApiKey(VALID_API_KEY)).thenReturn(merchantResponse);
         when(paymentRepository.existsByMerchantIdAndOrderId(merchantId, request.orderId())).thenReturn(false);
-        when(paymentRepository.save(any(Payment.class))).thenAnswer(invocation -> persistLikeJpa(invocation.getArgument(0)));
+        when(paymentRepository.save(any(Payment.class)))
+                .thenAnswer(invocation -> persistLikeJpa(invocation.getArgument(0)));
         when(fraudClient.checkPaymentRisk(any(FraudCheckRequest.class))).thenReturn(fraudResponse);
 
         doAnswer(invocation -> {
@@ -313,9 +401,7 @@ class PaymentServiceTest {
         }).when(paymentEventProducer).publishPaymentEvent(any(Payment.class));
 
         PaymentResponse response = paymentService.initiatePayment(
-                "valid-api-key",
-                "10.10.10.10",
-                request
+                VALID_API_KEY, IDEMPOTENCY_KEY, "10.10.10.10", request
         );
 
         assertThat(response).isNotNull();
@@ -324,10 +410,9 @@ class PaymentServiceTest {
         assertThat(response.providerResponseCode()).isEqualTo("FRAUD_REJECTED");
         assertThat(response.providerResponseMessage()).isEqualTo("Payment rejected due to high fraud risk");
 
-        assertThat(publishedStatuses).containsExactly(
-                PaymentStatus.INITIATED,
-                PaymentStatus.FAILED
-        );
+        assertThat(publishedStatuses).containsExactly(PaymentStatus.INITIATED, PaymentStatus.FAILED);
+
+        verify(paymentIdempotencyService).complete(idempotencyRecord.getId(), response);
 
         verify(paymentRepository, times(2)).save(any(Payment.class));
         verify(paymentEventProducer, times(2)).publishPaymentEvent(any(Payment.class));
@@ -349,19 +434,11 @@ class PaymentServiceTest {
                 PaymentProviderType.MOCK_BANK
         );
 
-        MerchantValidationResponse merchantResponse = new MerchantValidationResponse(
-                true,
-                merchantId,
-                "Provider Test Merchant",
-                "ACTIVE"
-        );
+        MerchantValidationResponse merchantResponse =
+                new MerchantValidationResponse(true, merchantId, "Provider Test Merchant", "ACTIVE");
 
         FraudCheckResponse fraudResponse = createFraudCheckResponse(
-                merchantId,
-                "APPROVED",
-                "LOW",
-                0,
-                "Payment risk is acceptable"
+                merchantId, "APPROVED", "LOW", 0, "Payment risk is acceptable"
         );
 
         ProviderPaymentResponse providerResponse = new ProviderPaymentResponse(
@@ -371,9 +448,11 @@ class PaymentServiceTest {
                 "Payment amount exceeds mock bank authorization limit"
         );
 
+        IdempotencyRecord idempotencyRecord = stubProcessingIdempotency(merchantId, request, IDEMPOTENCY_KEY);
+
         List<PaymentStatus> publishedStatuses = new ArrayList<>();
 
-        when(merchantClient.validateApiKey("valid-api-key")).thenReturn(merchantResponse);
+        when(merchantClient.validateApiKey(VALID_API_KEY)).thenReturn(merchantResponse);
         when(paymentRepository.existsByMerchantIdAndOrderId(merchantId, request.orderId())).thenReturn(false);
         when(paymentRepository.save(any(Payment.class))).thenAnswer(invocation -> persistLikeJpa(invocation.getArgument(0)));
         when(fraudClient.checkPaymentRisk(any(FraudCheckRequest.class))).thenReturn(fraudResponse);
@@ -387,9 +466,7 @@ class PaymentServiceTest {
         }).when(paymentEventProducer).publishPaymentEvent(any(Payment.class));
 
         PaymentResponse response = paymentService.initiatePayment(
-                "valid-api-key",
-                "192.168.1.10",
-                request
+                VALID_API_KEY, IDEMPOTENCY_KEY, CLIENT_IP, request
         );
 
         assertThat(response).isNotNull();
@@ -398,11 +475,9 @@ class PaymentServiceTest {
         assertThat(response.providerResponseCode()).isEqualTo("LIMIT_EXCEEDED");
         assertThat(response.providerResponseMessage()).isEqualTo("Payment amount exceeds mock bank authorization limit");
 
-        assertThat(publishedStatuses).containsExactly(
-                PaymentStatus.INITIATED,
-                PaymentStatus.FAILED
-        );
+        assertThat(publishedStatuses).containsExactly(PaymentStatus.INITIATED, PaymentStatus.FAILED);
 
+        verify(paymentIdempotencyService).complete(idempotencyRecord.getId(), response);
         verify(paymentRepository, times(2)).save(any(Payment.class));
         verify(paymentEventProducer, times(2)).publishPaymentEvent(any(Payment.class));
         verify(paymentNotificationProducer).publishPaymentNotification(any(Payment.class), eq("Provider Test Merchant"));
@@ -420,21 +495,13 @@ class PaymentServiceTest {
                 PaymentProviderType.MOCK_BANK
         );
 
-        MerchantValidationResponse merchantResponse = new MerchantValidationResponse(
-                true,
-                merchantId,
-                "Test Merchant",
-                "ACTIVE"
-        );
+        MerchantValidationResponse merchantResponse = new MerchantValidationResponse(true, merchantId, "Test Merchant", "ACTIVE");
 
-        ProviderPaymentResponse providerResponse = new ProviderPaymentResponse(
-                true,
-                "MOCK-BANK-REF-NULL-FRAUD",
-                "00",
-                "APPROVED"
-        );
+        ProviderPaymentResponse providerResponse = new ProviderPaymentResponse(true, "MOCK-BANK-REF-NULL-FRAUD", "00", "APPROVED");
 
-        when(merchantClient.validateApiKey("valid-api-key")).thenReturn(merchantResponse);
+        IdempotencyRecord idempotencyRecord = stubProcessingIdempotency(merchantId, request, IDEMPOTENCY_KEY);
+
+        when(merchantClient.validateApiKey(VALID_API_KEY)).thenReturn(merchantResponse);
         when(paymentRepository.existsByMerchantIdAndOrderId(merchantId, request.orderId())).thenReturn(false);
         when(paymentRepository.save(any(Payment.class))).thenAnswer(invocation -> persistLikeJpa(invocation.getArgument(0)));
         when(fraudClient.checkPaymentRisk(any(FraudCheckRequest.class))).thenReturn(null);
@@ -442,9 +509,7 @@ class PaymentServiceTest {
         when(paymentProviderClient.authorize(any(ProviderPaymentRequest.class))).thenReturn(providerResponse);
 
         PaymentResponse response = paymentService.initiatePayment(
-                "valid-api-key",
-                "192.168.1.10",
-                request
+                VALID_API_KEY, IDEMPOTENCY_KEY, CLIENT_IP, request
         );
 
         assertThat(response).isNotNull();
@@ -452,6 +517,7 @@ class PaymentServiceTest {
         assertThat(response.providerReferenceId()).isEqualTo("MOCK-BANK-REF-NULL-FRAUD");
         assertThat(response.providerResponseCode()).isEqualTo("00");
 
+        verify(paymentIdempotencyService).complete(idempotencyRecord.getId(), response);
         verify(paymentProviderFactory).getClient(PaymentProviderType.MOCK_BANK);
         verify(paymentProviderClient).authorize(any(ProviderPaymentRequest.class));
         verify(paymentNotificationProducer).publishPaymentNotification(any(Payment.class), eq("Test Merchant"));
@@ -553,6 +619,35 @@ class PaymentServiceTest {
         assertThat(responses.get(1).orderId()).isEqualTo("ORDER-MERCHANT-PAYMENT-1002");
     }
 
+    private IdempotencyRecord stubProcessingIdempotency(
+            UUID merchantId,
+            PaymentInitiateRequest request,
+            String idempotencyKey
+    ) {
+        String requestHash = "request-hash-" + request.orderId();
+
+        IdempotencyRecord record = IdempotencyRecord.builder()
+                .id(UUID.randomUUID())
+                .merchantId(merchantId)
+                .operation(IdempotencyOperation.PAYMENT_INITIATION)
+                .idempotencyKey(idempotencyKey)
+                .requestHash(requestHash)
+                .status(IdempotencyStatus.PROCESSING)
+                .createdAt(LocalDateTime.now())
+                .build();
+
+        when(paymentRequestFingerprint.calculate(request)).thenReturn(requestHash);
+
+        when(paymentIdempotencyService.acquire(
+                merchantId,
+                IdempotencyOperation.PAYMENT_INITIATION,
+                idempotencyKey,
+                requestHash
+        )).thenReturn(record);
+
+        return record;
+    }
+
     private PaymentInitiateRequest createPaymentInitiateRequest(
             BigDecimal amount,
             String currency,
@@ -599,7 +694,6 @@ class PaymentServiceTest {
         }
 
         payment.setUpdatedAt(LocalDateTime.now());
-
         return payment;
     }
 
