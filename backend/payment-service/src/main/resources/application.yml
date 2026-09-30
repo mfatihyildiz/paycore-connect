@@ -15,13 +15,16 @@ spring:
     bootstrap-servers: ${SPRING_KAFKA_BOOTSTRAP_SERVERS:localhost:9092}
     producer:
       key-serializer: org.apache.kafka.common.serialization.StringSerializer
-      value-serializer: org.springframework.kafka.support.serializer.JsonSerializer
+      value-serializer: org.apache.kafka.common.serialization.StringSerializer
 
   rabbitmq:
     host: ${SPRING_RABBITMQ_HOST:localhost}
     port: ${SPRING_RABBITMQ_PORT:5672}
     username: ${SPRING_RABBITMQ_USERNAME:paycore}
     password: ${SPRING_RABBITMQ_PASSWORD:paycore}
+
+    publisher-confirm-type: correlated
+    publisher-returns: true
 
   jpa:
     hibernate:
@@ -48,6 +51,12 @@ paycore:
     exchange: notification.exchange
     payment-notification-queue: payment.notification.queue
     payment-notification-routing-key: payment.notification.created
+
+  outbox:
+    batch-size: ${OUTBOX_BATCH_SIZE:10}
+    poll-interval-ms: ${OUTBOX_POLL_INTERVAL_MS:1000}
+    lease-timeout-seconds: ${OUTBOX_LEASE_TIMEOUT_SECONDS:120}
+    publish-timeout-seconds: ${OUTBOX_PUBLISH_TIMEOUT_SECONDS:5}
 
 management:
   endpoints:

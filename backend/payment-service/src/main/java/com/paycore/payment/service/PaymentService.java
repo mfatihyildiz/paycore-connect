@@ -12,19 +12,16 @@ import com.paycore.payment.dto.FraudCheckResponse;
 import com.paycore.payment.dto.MerchantValidationResponse;
 import com.paycore.payment.dto.PaymentInitiateRequest;
 import com.paycore.payment.dto.PaymentResponse;
-import com.paycore.payment.event.PaymentEventProducer;
 import com.paycore.payment.exception.DuplicateOrderException;
 import com.paycore.payment.exception.InvalidMerchantApiKeyException;
 import com.paycore.payment.exception.PaymentNotFoundException;
 import com.paycore.payment.idempotency.PaymentRequestFingerprint;
-import com.paycore.payment.notification.PaymentNotificationProducer;
 import com.paycore.payment.provider.PaymentProviderClient;
 import com.paycore.payment.provider.PaymentProviderFactory;
 import com.paycore.payment.provider.ProviderPaymentRequest;
 import com.paycore.payment.provider.ProviderPaymentResponse;
 import com.paycore.payment.repository.PaymentRepository;
 import lombok.RequiredArgsConstructor;
-import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
@@ -38,10 +35,8 @@ public class PaymentService {
     private final PaymentRepository paymentRepository;
     private final MerchantClient merchantClient;
     private final PaymentProviderFactory paymentProviderFactory;
-    private final PaymentEventProducer paymentEventProducer;
     private final FraudClient fraudClient;
-    private final PaymentNotificationProducer paymentNotificationProducer;
-
+    private final PaymentPersistenceService paymentPersistenceService;
     private final PaymentIdempotencyService paymentIdempotencyService;
     private final PaymentRequestFingerprint paymentRequestFingerprint;
 
@@ -61,13 +56,12 @@ public class PaymentService {
 
         String requestHash = paymentRequestFingerprint.calculate(request);
 
-        IdempotencyRecord idempotencyRecord =
-                paymentIdempotencyService.acquire(
-                        merchant.merchantId(),
-                        IdempotencyOperation.PAYMENT_INITIATION,
-                        idempotencyKey,
-                        requestHash
-                );
+        IdempotencyRecord idempotencyRecord = paymentIdempotencyService.acquire(
+                merchant.merchantId(),
+                IdempotencyOperation.PAYMENT_INITIATION,
+                idempotencyKey,
+                requestHash
+        );
 
         if (idempotencyRecord.getStatus() == IdempotencyStatus.COMPLETED) {
             return paymentIdempotencyService.replay(idempotencyRecord);
@@ -83,8 +77,11 @@ public class PaymentService {
         }
     }
 
-    private PaymentResponse processPayment(MerchantValidationResponse merchant, String ipAddress, PaymentInitiateRequest request) {
-
+    private PaymentResponse processPayment(
+            MerchantValidationResponse merchant,
+            String ipAddress,
+            PaymentInitiateRequest request
+    ) {
         if (paymentRepository.existsByMerchantIdAndOrderId(merchant.merchantId(), request.orderId())) {
             throw new DuplicateOrderException(merchant.merchantId(), request.orderId());
         }
@@ -99,15 +96,7 @@ public class PaymentService {
                 .cardLastFourDigits(extractCardLastFourDigits(request.cardToken()))
                 .build();
 
-        Payment savedInitiatedPayment;
-
-        try {
-            savedInitiatedPayment = paymentRepository.save(initiatedPayment);
-        } catch (DataIntegrityViolationException exception) {
-            throw new DuplicateOrderException(merchant.merchantId(), request.orderId());
-        }
-
-        paymentEventProducer.publishPaymentEvent(savedInitiatedPayment);
+        Payment savedInitiatedPayment = paymentPersistenceService.createInitiatedPayment(initiatedPayment);
 
         FraudCheckResponse fraudCheckResponse = fraudClient.checkPaymentRisk(
                 new FraudCheckRequest(
@@ -122,14 +111,14 @@ public class PaymentService {
         );
 
         if (fraudCheckResponse != null && "REJECTED".equals(fraudCheckResponse.decision())) {
-            savedInitiatedPayment.setProviderReferenceId(null);
-            savedInitiatedPayment.setProviderResponseCode("FRAUD_REJECTED");
-            savedInitiatedPayment.setProviderResponseMessage(fraudCheckResponse.message());
-            savedInitiatedPayment.setStatus(PaymentStatus.FAILED);
-
-            Payment rejectedPayment = paymentRepository.save(savedInitiatedPayment);
-            paymentEventProducer.publishPaymentEvent(rejectedPayment);
-            paymentNotificationProducer.publishPaymentNotification(rejectedPayment, merchant.merchantName());
+            Payment rejectedPayment = paymentPersistenceService.finalizePayment(
+                    savedInitiatedPayment.getId(),
+                    PaymentStatus.FAILED,
+                    null,
+                    "FRAUD_REJECTED",
+                    fraudCheckResponse.message(),
+                    merchant.merchantName()
+            );
 
             return toResponse(rejectedPayment);
         }
@@ -146,17 +135,16 @@ public class PaymentService {
                 )
         );
 
-        savedInitiatedPayment.setProviderReferenceId(providerResponse.providerReferenceId());
-        savedInitiatedPayment.setProviderResponseCode(providerResponse.responseCode());
-        savedInitiatedPayment.setProviderResponseMessage(providerResponse.responseMessage());
-        savedInitiatedPayment.setStatus(
-                providerResponse.approved() ? PaymentStatus.AUTHORIZED : PaymentStatus.FAILED
+        PaymentStatus finalStatus = providerResponse.approved() ? PaymentStatus.AUTHORIZED : PaymentStatus.FAILED;
+
+        Payment finalPayment = paymentPersistenceService.finalizePayment(
+                savedInitiatedPayment.getId(),
+                finalStatus,
+                providerResponse.providerReferenceId(),
+                providerResponse.responseCode(),
+                providerResponse.responseMessage(),
+                merchant.merchantName()
         );
-
-        Payment finalPayment = paymentRepository.save(savedInitiatedPayment);
-
-        paymentEventProducer.publishPaymentEvent(finalPayment);
-        paymentNotificationProducer.publishPaymentNotification(finalPayment, merchant.merchantName());
 
         return toResponse(finalPayment);
     }
@@ -171,8 +159,7 @@ public class PaymentService {
 
     @Transactional(readOnly = true)
     public List<PaymentResponse> getPaymentsByMerchantId(UUID merchantId) {
-        return paymentRepository
-                .findByMerchantIdOrderByCreatedAtDesc(merchantId)
+        return paymentRepository.findByMerchantIdOrderByCreatedAtDesc(merchantId)
                 .stream()
                 .map(this::toResponse)
                 .toList();

@@ -1,151 +1,76 @@
 package com.paycore.payment.notification;
 
-import com.paycore.payment.domain.Payment;
-import com.paycore.payment.domain.PaymentProviderType;
-import com.paycore.payment.domain.PaymentStatus;
-import com.paycore.payment.dto.PaymentNotificationMessage;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.mockito.ArgumentCaptor;
+import org.springframework.amqp.core.Message;
+import org.springframework.amqp.rabbit.connection.CorrelationData;
 import org.springframework.amqp.rabbit.core.RabbitTemplate;
-import org.springframework.test.util.ReflectionTestUtils;
 
-import java.math.BigDecimal;
-import java.time.LocalDateTime;
+import java.nio.charset.StandardCharsets;
 import java.util.UUID;
+import java.util.concurrent.CompletableFuture;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
+import static org.mockito.ArgumentMatchers.*;
 import static org.mockito.Mockito.*;
 
 class PaymentNotificationProducerTest {
 
     private RabbitTemplate rabbitTemplate;
-    private PaymentNotificationProducer paymentNotificationProducer;
+    private PaymentNotificationProducer producer;
 
     @BeforeEach
     void setUp() {
         rabbitTemplate = mock(RabbitTemplate.class);
-        paymentNotificationProducer = new PaymentNotificationProducer(rabbitTemplate);
-
-        ReflectionTestUtils.setField(
-                paymentNotificationProducer,
-                "exchange",
-                "payment-exchange"
-        );
-
-        ReflectionTestUtils.setField(
-                paymentNotificationProducer,
-                "paymentNotificationRoutingKey",
-                "payment-notification-routing-key"
-        );
+        producer = new PaymentNotificationProducer(rabbitTemplate);
     }
 
     @Test
-    void publishPaymentNotification_shouldSendNotificationMessageToRabbitMq() {
-        UUID paymentId = UUID.randomUUID();
-        UUID merchantId = UUID.randomUUID();
+    void publish_shouldCompleteSuccessfully_whenRabbitMqAcknowledgesMessage() {
+        String exchange = "notification.exchange";
+        String routingKey = "payment.notification.created";
+        String payload = "{\"notificationId\":\"test\"}";
+        UUID eventId = UUID.randomUUID();
 
-        Payment payment = Payment.builder()
-                .id(paymentId)
-                .merchantId(merchantId)
-                .amount(new BigDecimal("1000.00"))
-                .currency("TRY")
-                .status(PaymentStatus.AUTHORIZED)
-                .providerType(PaymentProviderType.MOCK_BANK)
-                .orderId("ORDER-PAYMENT-NOTIFICATION-PRODUCER-1001")
-                .providerReferenceId("MOCK-BANK-REF-1001")
-                .providerResponseCode("00")
-                .providerResponseMessage("APPROVED")
-                .cardLastFourDigits("3456")
-                .createdAt(LocalDateTime.now().minusMinutes(1))
-                .updatedAt(LocalDateTime.now())
-                .build();
+        doAnswer(invocation -> {
+            CorrelationData correlationData = invocation.getArgument(3);
+            correlationData.getFuture().complete(new CorrelationData.Confirm(true, null));
 
-        LocalDateTime beforePublish = LocalDateTime.now();
+            return null;
+        }).when(rabbitTemplate).send(eq(exchange), eq(routingKey), any(Message.class), any(CorrelationData.class));
 
-        paymentNotificationProducer.publishPaymentNotification(payment, "Test Merchant");
+        CompletableFuture<Void> future = producer.publish(exchange, routingKey, payload, eventId);
 
-        LocalDateTime afterPublish = LocalDateTime.now();
+        future.join();
 
-        ArgumentCaptor<PaymentNotificationMessage> messageCaptor =
-                ArgumentCaptor.forClass(PaymentNotificationMessage.class);
+        ArgumentCaptor<Message> messageCaptor = ArgumentCaptor.forClass(Message.class);
 
-        verify(rabbitTemplate).convertAndSend(
-                eq("payment-exchange"),
-                eq("payment-notification-routing-key"),
-                messageCaptor.capture()
-        );
+        verify(rabbitTemplate).send(eq(exchange), eq(routingKey), messageCaptor.capture(), any(CorrelationData.class));
 
-        PaymentNotificationMessage capturedMessage = messageCaptor.getValue();
+        Message message = messageCaptor.getValue();
 
-        assertThat(capturedMessage.notificationId()).isNotNull();
-        assertThat(capturedMessage.paymentId()).isEqualTo(paymentId);
-        assertThat(capturedMessage.merchantId()).isEqualTo(merchantId);
-        assertThat(capturedMessage.merchantName()).isEqualTo("Test Merchant");
-        assertThat(capturedMessage.amount()).isEqualByComparingTo("1000.00");
-        assertThat(capturedMessage.currency()).isEqualTo("TRY");
-        assertThat(capturedMessage.orderId()).isEqualTo("ORDER-PAYMENT-NOTIFICATION-PRODUCER-1001");
-        assertThat(capturedMessage.paymentStatus()).isEqualTo("AUTHORIZED");
-        assertThat(capturedMessage.providerType()).isEqualTo("MOCK_BANK");
-        assertThat(capturedMessage.providerReferenceId()).isEqualTo("MOCK-BANK-REF-1001");
-        assertThat(capturedMessage.providerResponseCode()).isEqualTo("00");
-        assertThat(capturedMessage.providerResponseMessage()).isEqualTo("APPROVED");
-        assertThat(capturedMessage.occurredAt()).isNotNull();
-        assertThat(capturedMessage.occurredAt()).isAfterOrEqualTo(beforePublish);
-        assertThat(capturedMessage.occurredAt()).isBeforeOrEqualTo(afterPublish);
-
-        verifyNoMoreInteractions(rabbitTemplate);
+        assertThat(new String(message.getBody(), StandardCharsets.UTF_8)).isEqualTo(payload);
     }
 
     @Test
-    void publishPaymentNotification_shouldSendFailedPaymentNotificationMessage() {
-        UUID paymentId = UUID.randomUUID();
-        UUID merchantId = UUID.randomUUID();
+    void publish_shouldFail_whenRabbitMqReturnsNack() {
+        String exchange = "notification.exchange";
+        String routingKey = "payment.notification.created";
+        String payload = "{\"notificationId\":\"test\"}";
+        UUID eventId = UUID.randomUUID();
 
-        Payment payment = Payment.builder()
-                .id(paymentId)
-                .merchantId(merchantId)
-                .amount(new BigDecimal("2000.00"))
-                .currency("TRY")
-                .status(PaymentStatus.FAILED)
-                .providerType(PaymentProviderType.MOCK_BANK)
-                .orderId("ORDER-PAYMENT-NOTIFICATION-FAILED-1001")
-                .providerReferenceId(null)
-                .providerResponseCode("LIMIT_EXCEEDED")
-                .providerResponseMessage("Payment amount exceeds mock bank authorization limit")
-                .cardLastFourDigits("3456")
-                .createdAt(LocalDateTime.now().minusMinutes(1))
-                .updatedAt(LocalDateTime.now())
-                .build();
+        doAnswer(invocation -> {
+            CorrelationData correlationData = invocation.getArgument(3);
 
-        paymentNotificationProducer.publishPaymentNotification(payment, "Failed Merchant");
+            correlationData.getFuture().complete(new CorrelationData.Confirm(false, "nack"));
 
-        ArgumentCaptor<PaymentNotificationMessage> messageCaptor =
-                ArgumentCaptor.forClass(PaymentNotificationMessage.class);
+            return null;
+        }).when(rabbitTemplate).send(eq(exchange), eq(routingKey), any(Message.class), any(CorrelationData.class));
 
-        verify(rabbitTemplate).convertAndSend(
-                eq("payment-exchange"),
-                eq("payment-notification-routing-key"),
-                messageCaptor.capture()
-        );
+        CompletableFuture<Void> future = producer.publish(exchange, routingKey, payload, eventId);
 
-        PaymentNotificationMessage capturedMessage = messageCaptor.getValue();
-
-        assertThat(capturedMessage.notificationId()).isNotNull();
-        assertThat(capturedMessage.paymentId()).isEqualTo(paymentId);
-        assertThat(capturedMessage.merchantId()).isEqualTo(merchantId);
-        assertThat(capturedMessage.merchantName()).isEqualTo("Failed Merchant");
-        assertThat(capturedMessage.amount()).isEqualByComparingTo("2000.00");
-        assertThat(capturedMessage.currency()).isEqualTo("TRY");
-        assertThat(capturedMessage.orderId()).isEqualTo("ORDER-PAYMENT-NOTIFICATION-FAILED-1001");
-        assertThat(capturedMessage.paymentStatus()).isEqualTo("FAILED");
-        assertThat(capturedMessage.providerType()).isEqualTo("MOCK_BANK");
-        assertThat(capturedMessage.providerReferenceId()).isNull();
-        assertThat(capturedMessage.providerResponseCode()).isEqualTo("LIMIT_EXCEEDED");
-        assertThat(capturedMessage.providerResponseMessage())
-                .isEqualTo("Payment amount exceeds mock bank authorization limit");
-        assertThat(capturedMessage.occurredAt()).isNotNull();
-
-        verifyNoMoreInteractions(rabbitTemplate);
+        assertThatThrownBy(future::join).hasCauseInstanceOf(IllegalStateException.class);
     }
 }

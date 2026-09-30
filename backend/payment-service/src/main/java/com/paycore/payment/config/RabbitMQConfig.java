@@ -54,6 +54,8 @@ public class RabbitMQConfig {
     ) {
         RabbitTemplate rabbitTemplate = new RabbitTemplate(connectionFactory);
         rabbitTemplate.setMessageConverter(rabbitMessageConverter);
+        rabbitTemplate.setMandatory(true);
+
         return rabbitTemplate;
     }
 }
