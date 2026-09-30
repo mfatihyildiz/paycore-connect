@@ -4,7 +4,7 @@
 
 This document describes the test strategy, test scope, test coverage, execution commands, and verified scenarios for **PayCore Connect — Payment Orchestration Platform**.
 
-PayCore Connect is structured as a multi service fintech backend platform. The system includes payment orchestration, merchant validation, fraud checks, payment event publishing, ledger reconstruction, settlement calculation, notification processing, legacy SOAP bank integration, and API gateway routing support.
+PayCore Connect is structured as a multi service fintech backend platform. The system includes payment orchestration, merchant validation, PostgreSQL backed HTTP idempotency, fraud checks, payment event publishing, ledger reconstruction, settlement calculation, notification processing, legacy SOAP bank integration, and API gateway routing support.
 
 The test suite was designed to validate the main business logic, REST controllers, event driven adapters, provider clients, external service wrappers, and configuration components without requiring real infrastructure such as Kafka, RabbitMQ, Redis, MongoDB, PostgreSQL, or external SOAP/REST services during unit level execution.
 
@@ -18,7 +18,7 @@ The following backend services are covered by the test suite:
 |---|---------------------------------------------------------------------------------------------------------------------------------------------------------|
 | `fraud-service` | Evaluates payment risk and stores fraud check results                                                                                                   |
 | `merchant-service` | Manages merchants, API keys, status updates, and API key validation                                                                                     |
-| `payment-service` | Orchestrates payment initiation, merchant validation, fraud check, provider authorization, Kafka event publishing, and RabbitMQ notification publishing |
+| `payment-service` | Orchestrates idempotent payment initiation, merchant validation, fraud check, provider authorization, Kafka event publishing, and RabbitMQ notification publishing |
 | `ledger-service` | Consumes payment events and reconstructs payment state from event history                                                                               |
 | `settlement-service` | Consumes authorized payment events and calculates merchant settlement amounts                                                                           |
 | `notification-service` | Consumes payment notification messages and stores simulated notification logs                                                                           |
@@ -59,6 +59,11 @@ The overall strategy is layered:
     - Validate CORS configuration and gateway request logging behavior.
     - No gateway runtime is required.
 
+7. **Manual Docker E2E Acceptance**
+    - Validate payment idempotency against the real Docker Compose stack.
+    - Exercise API Gateway, Payment Service, Merchant Service, Fraud Service, and PostgreSQL through the running environment.
+    - Verify replay behavior, conflict behavior, duplicate-order cleanup, and concurrent same-key requests against real PostgreSQL constraints.
+
 ---
 
 ## 4. Test Environment
@@ -75,7 +80,7 @@ Recommended local environment:
 | Spring Test | MockMvc, MockRestServiceServer, ReflectionTestUtils |
 | Serialization | Jackson JavaTimeModule where needed |
 
-The tests are intentionally designed to run locally without requiring:
+The automated unit and controller tests are intentionally designed to run locally without requiring:
 
 - PostgreSQL
 - MongoDB
@@ -84,6 +89,8 @@ The tests are intentionally designed to run locally without requiring:
 - RabbitMQ
 - External REST services
 - External SOAP services
+
+A separate manual Docker E2E acceptance pass is used for payment idempotency. That validation runs against the real Docker Compose environment and real PostgreSQL state rather than mocks.
 
 ---
 
@@ -307,14 +314,21 @@ Covered scenarios:
 
 ### PaymentServiceTest Coverage
 
-The payment service is the central orchestration layer. It validates merchant API keys, checks duplicate orders, persists payment state, calls fraud service, authorizes payment through provider clients, publishes Kafka events, and publishes notification messages.
+The payment service is the central orchestration layer. It validates idempotency keys and merchant API keys, acquires durable request ownership in PostgreSQL, replays completed responses, checks duplicate orders, persists payment state, calls fraud service, authorizes payment through provider clients, publishes Kafka events, and publishes notification messages.
 
 Covered scenarios:
 
 - Valid payment request creates initiated payment
+- Idempotency key is validated before payment processing
+- Request fingerprint is calculated before idempotency acquisition
+- Completed idempotency record replays the previously stored `PaymentResponse`
+- Replay skips payment persistence, fraud checks, provider authorization, Kafka publishing, RabbitMQ publishing, and idempotency completion
+- Same idempotency key with a changed payload is rejected
+- Same idempotency key while the original request is still `PROCESSING` is rejected
+- Duplicate order throws `DuplicateOrderException`
+- Duplicate order releases the temporary idempotency reservation
 - Merchant API key is validated before payment processing
 - Invalid merchant API key throws `InvalidMerchantApiKeyException`
-- Duplicate order throws `DuplicateOrderException`
 - Payment currency is normalized to uppercase
 - Card last four digits are extracted from card token
 - Initiated payment event is published
@@ -326,6 +340,7 @@ Covered scenarios:
 - Approved provider response marks payment as `AUTHORIZED`
 - Failed provider response marks payment as `FAILED`
 - Provider response fields are stored on payment
+- Successful, fraud-rejected, and provider-rejected outcomes complete the idempotency record
 - Payment can be retrieved by ID
 - Missing payment throws `PaymentNotFoundException`
 - Merchant payment list is returned
@@ -343,6 +358,11 @@ GET /api/payments/merchant/{merchantId}
 Covered scenarios:
 
 - Valid payment initiation returns `201 Created`
+- `Idempotency-Key` header is forwarded to `PaymentService`
+- Missing `Idempotency-Key` returns `400 Bad Request`
+- Invalid idempotency key returns `400 Bad Request`
+- Reused idempotency key with different request parameters returns `409 Conflict`
+- In-progress idempotency request returns `409 Conflict`
 - `X-Forwarded-For` header is parsed and first IP is used
 - Missing `X-Forwarded-For` uses `"unknown"` client IP
 - Missing `X-API-Key` returns `400 Bad Request`
@@ -352,6 +372,36 @@ Covered scenarios:
 - Payment by ID returns `200 OK`
 - Missing payment returns `404 Not Found`
 - Merchant payment list returns `200 OK`
+
+### Payment Service Suite Result
+
+The verified payment-service test run completed with:
+
+```text
+Tests run: 46
+Failures: 0
+Errors: 0
+Skipped: 1
+```
+
+The skipped test is intentionally disabled at service level and is not an idempotency failure.
+
+### Payment Idempotency Request Contract
+
+`POST /api/payments/initiate` requires:
+
+```http
+X-API-Key: <merchant-api-key>
+Idempotency-Key: <unique-key-for-this-logical-payment>
+```
+
+Verified semantics:
+
+- Same key + same request after completion returns the previously stored payment response
+- Same key + different request returns `409 Conflict`
+- Same key while the first request is still processing returns `409 Conflict`
+- Different keys remain independent
+- Duplicate order handling is separate from HTTP idempotency
 
 ### PaymentInitiateRequest Validation Covered
 
@@ -759,6 +809,9 @@ The test suite validates exception handling across multiple services.
 |---|---|
 | `PaymentNotFoundException` | `404 Not Found` |
 | `InvalidMerchantApiKeyException` | `401 Unauthorized` |
+| `InvalidIdempotencyKeyException` | `400 Bad Request` |
+| `IdempotencyKeyReuseException` | `409 Conflict` |
+| `IdempotencyRequestInProgressException` | `409 Conflict` |
 | `DuplicateOrderException` | `409 Conflict` |
 | `IllegalArgumentException` | `400 Bad Request` |
 | `FraudRejectedPaymentException` | `403 Forbidden` |
@@ -810,6 +863,15 @@ Covered fields:
 - `orderId`
 - `cardToken`
 - `providerType`
+
+## Payment Idempotency Header Validation
+
+Covered behavior:
+
+- Missing `Idempotency-Key` header returns `400 Bad Request`
+- Null or blank idempotency key is rejected
+- Idempotency keys longer than 255 characters are rejected
+- Valid keys are scoped by merchant and payment initiation operation
 
 ---
 
@@ -910,31 +972,140 @@ This verifies:
 - Response mapping
 - Error propagation
 
+## 12.5 Database-Backed Idempotency Acceptance
+
+Payment idempotency correctness depends on real PostgreSQL uniqueness and transaction behavior, so the acceptance pass does not rely only on mocked repository tests.
+
+The implementation uses:
+
+```sql
+INSERT ... ON CONFLICT DO NOTHING
+```
+
+to atomically acquire an idempotency key scoped by merchant and operation.
+
+The manual Docker acceptance pass verifies that:
+
+- Only one request owns a new idempotency key
+- Requests arriving while the owner is processing receive a conflict
+- Requests arriving after completion replay the same payment response
+- Concurrent successful responses all reference the same payment ID
+- Only one payment row exists for the tested order
+- Only one idempotency row exists for the tested key
+- Duplicate-order failure removes the temporary processing reservation
+
 ---
 
-# 13. Known Non-Goals of the Current Test Suite
+# 13. Manual Docker E2E Acceptance
 
-The current suite does not aim to provide full end to end infrastructure testing.
+The payment idempotency feature was validated against the running Docker Compose stack through API Gateway on:
 
-Not currently covered:
+```text
+http://localhost:8090
+```
 
-- Real Kafka broker integration
-- Real RabbitMQ integration
-- Real Redis integration
-- Real MongoDB integration
-- Real PostgreSQL integration
-- Docker Compose end to end payment flow
+The test used an active merchant API key and the real Payment Service PostgreSQL database.
+
+## 13.1 Completed Response Replay
+
+A payment was submitted with a new idempotency key and returned `201 Created`.
+
+The exact same key and request body were submitted again.
+
+Verified result:
+
+- Second request returned `201 Created`
+- The returned payment ID was identical to the first payment ID
+- No second payment row was created
+
+This confirms completed-response replay.
+
+## 13.2 Same Key with Different Payload
+
+The same idempotency key was reused while changing the payment amount.
+
+Verified result:
+
+```text
+409 Conflict
+```
+
+This confirms that the same key cannot represent a different logical request.
+
+## 13.3 New Key with Existing Order ID
+
+A new idempotency key was used with the already processed merchant order.
+
+Verified result:
+
+```text
+409 Conflict
+```
+
+Database verification confirmed:
+
+- Only one payment row existed for the order
+- The temporary idempotency reservation for the duplicate-order attempt was released
+- Querying the duplicate-order idempotency key returned a row count of `0`
+
+This confirms that HTTP idempotency and duplicate-order protection remain separate invariants.
+
+## 13.4 Missing Idempotency Header
+
+Payment initiation without `Idempotency-Key` returned:
+
+```text
+400 Bad Request
+```
+
+## 13.5 Concurrent Same-Key Requests
+
+Ten payment requests using the same merchant, idempotency key, order ID, and request body were started concurrently.
+
+Observed result:
+
+```text
+3 requests -> 409 Conflict while the owner request was PROCESSING
+7 requests -> 201 Created after the completed response became replayable
+```
+
+The exact timing distribution is not itself an invariant; depending on scheduling, a request may observe either `PROCESSING` or `COMPLETED`.
+
+The correctness invariants were all satisfied:
+
+- All `201` responses contained the same payment ID
+- PostgreSQL contained exactly one payment row for the tested order
+- PostgreSQL contained exactly one idempotency row for the tested key
+- The idempotency row ended in `COMPLETED`
+- The idempotency row referenced the single created payment
+
+This verifies same-key race protection against real PostgreSQL behavior rather than only mocked unit tests.
+
+---
+
+# 14. Known Non-Goals of the Current Test Suite
+
+The fast automated suite does not aim to provide full end to end infrastructure testing.
+
+Payment idempotency has been manually validated against the real Docker Compose stack and PostgreSQL, but the following are not yet covered by repeatable automated infrastructure tests:
+
+- Automated real Kafka broker integration
+- Automated real RabbitMQ integration
+- Automated real Redis integration
+- Automated real MongoDB integration
+- Automated real PostgreSQL/Testcontainers integration
+- Full cross-service Docker E2E verification through ledger, settlement, and notification outputs
 - Contract testing between services
 - Performance/load testing
 - Security penetration testing
 
-These are valid future improvements but intentionally out of scope for the current fast running test suite.
+These remain future improvements. The manual payment idempotency acceptance pass is documented separately above and should not be confused with an automated integration test suite.
 
 ---
 
-# 14. Recommended Future Improvements
+# 15. Recommended Future Improvements
 
-## 14.1 Testcontainers Integration
+## 15.1 Testcontainers Integration
 
 Add Testcontainers based integration tests for:
 
@@ -944,11 +1115,13 @@ Add Testcontainers based integration tests for:
 - Kafka
 - RabbitMQ
 
-This would allow more realistic integration validation while keeping tests repeatable.
+The PostgreSQL suite should include an automated concurrent idempotency test that verifies atomic acquisition, completed replay, request mismatch conflicts, and final database row counts.
 
-## 14.2 End to End Payment Flow Test
+This would convert the current manual PostgreSQL acceptance checks into repeatable CI-safe integration tests.
 
-Create an E2E test for the full successful payment flow:
+## 15.2 Full Cross-Service End to End Payment Flow Test
+
+Automate the full successful cross-service payment flow:
 
 ```text
 Merchant API Key
@@ -962,7 +1135,7 @@ Merchant API Key
 -> Notification Log
 ```
 
-## 14.3 Contract Tests
+## 15.3 Contract Tests
 
 Introduce contract tests between:
 
@@ -975,7 +1148,7 @@ Recommended tools:
 - Spring Cloud Contract
 - Pact
 
-## 14.4 CI Pipeline
+## 15.4 CI Pipeline
 
 Add GitHub Actions or GitLab CI pipeline:
 
@@ -994,7 +1167,7 @@ Recommended CI stages:
 5. Package
 6. Docker build
 
-## 14.5 Coverage Reporting
+## 15.5 Coverage Reporting
 
 Add JaCoCo to each service and generate reports:
 
@@ -1013,27 +1186,30 @@ Recommended minimum coverage target:
 
 ---
 
-# 15. Overall Coverage Summary
+# 16. Overall Coverage Summary
 
-| Area                            | Status |
-|---------------------------------|---|
-| Business service logic          | Covered |
-| REST controllers                | Covered |
-| Validation handling             | Covered |
-| Exception handling              | Covered |
-| Kafka consumers                 | Covered |
-| Kafka producers                 | Covered |
-| RabbitMQ consumers              | Covered |
-| RabbitMQ producers              | Covered |
-| REST clients                    | Covered |
-| SOAP provider client            | Covered |
-| Gateway config/filter           | Covered |
-| Real infrastructure integration | Future improvement |
-| End to end Docker flow          | Future improvement |
+| Area | Status |
+|---|---|
+| Business service logic | Covered |
+| REST controllers | Covered |
+| Validation handling | Covered |
+| Exception handling | Covered |
+| Payment idempotency unit/controller behavior | Covered |
+| Payment idempotency Docker/PostgreSQL acceptance | Manually verified |
+| Concurrent same-key payment protection | Manually verified |
+| Kafka consumers | Covered |
+| Kafka producers | Covered |
+| RabbitMQ consumers | Covered |
+| RabbitMQ producers | Covered |
+| REST clients | Covered |
+| SOAP provider client | Covered |
+| Gateway config/filter | Covered |
+| Automated real-infrastructure integration | Future improvement |
+| Full cross-service Docker E2E | Future improvement |
 
 ---
 
-# 16. Final Assessment
+# 17. Final Assessment
 
 The current test suite provides strong coverage for the core backend responsibilities of PayCore Connect.
 
@@ -1041,7 +1217,11 @@ The most important verified capabilities are:
 
 - Merchant API key validation flow
 - Payment initiation orchestration
-- Duplicate order prevention
+- Required payment idempotency header handling
+- Completed response replay
+- Same-key payload mismatch protection
+- Concurrent same-key race protection against real PostgreSQL
+- Duplicate order prevention and idempotency reservation cleanup
 - Fraud risk decision handling
 - Provider authorization handling
 - Payment state transitions
@@ -1054,4 +1234,3 @@ The most important verified capabilities are:
 - Centralized exception handling behavior
 
 The project is now in a significantly stronger state for portfolio presentation, technical review, and CI integration.
-

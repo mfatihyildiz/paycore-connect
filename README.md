@@ -4,7 +4,7 @@
 
 The project simulates a real world payment infrastructure where merchants can initiate payments, validate API keys, route payment requests to mock or legacy banking providers, run fraud checks, publish payment events, create ledger records, calculate settlements, and generate notification logs.
 
-The main purpose of this project is to demonstrate a production oriented backend architecture using synchronous and asynchronous communication patterns, multiple persistence technologies, API Gateway routing, event driven processing, SOAP integration, and a React based dashboard.
+The main purpose of this project is to demonstrate a production oriented backend architecture using synchronous and asynchronous communication patterns, multiple persistence technologies, API Gateway routing, event driven processing, SOAP integration, database migrations, PostgreSQL backed HTTP idempotency, and a React based dashboard.
 
 ---
 
@@ -18,6 +18,7 @@ The main purpose of this project is to demonstrate a production oriented backend
 * [Main Business Flow](#main-business-flow)
 * [Communication Patterns](#communication-patterns)
 * [Data Storage Design](#data-storage-design)
+* [Payment Idempotency](#payment-idempotency)
 * [Event-Driven Architecture](#event-driven-architecture)
 * [Fraud Detection Flow](#fraud-detection-flow)
 * [SOAP Legacy Bank Integration](#soap-legacy-bank-integration)
@@ -44,7 +45,8 @@ The system allows merchants to:
 
 * Register as a merchant.
 * Generate and use API keys.
-* Initiate payment requests.
+* Initiate payment requests with a required `Idempotency-Key`.
+* Safely retry the same logical payment request without creating duplicate payments.
 * Route payments to different payment providers.
 * Run fraud checks before authorization.
 * Store payment records.
@@ -108,6 +110,7 @@ The system consists of the following main layers:
 * Spring AMQP
 * Spring Web Services
 * Hibernate
+* Flyway
 * Maven
 
 ### Frontend
@@ -178,17 +181,23 @@ The Payment Service is the central orchestration service of the system.
 It is responsible for:
 
 * Receiving payment initiation requests.
+* Requiring and validating an `Idempotency-Key` for payment initiation.
+* Preventing duplicate processing for retried or concurrent requests.
+* Replaying the previously completed payment response for a matching retry.
+* Rejecting idempotency key reuse when the request payload changes.
 * Validating merchant API keys through Merchant Service.
 * Calling Fraud Service before payment authorization.
 * Routing payments to the selected provider.
 * Supporting mock and legacy SOAP bank providers.
 * Persisting payment data.
+* Enforcing one payment per `(merchant_id, order_id)` business key.
 * Publishing payment events to Kafka.
 * Publishing notification messages to RabbitMQ.
 
 This service uses:
 
-* **PostgreSQL** for payment transaction records.
+* **PostgreSQL** for payment transaction records and durable idempotency state.
+* **Flyway** for versioned payment database migrations.
 * **REST** for merchant validation and fraud checks.
 * **SOAP** for legacy bank authorization.
 * **Kafka** for payment domain events.
@@ -224,9 +233,9 @@ It is responsible for:
 * Reconstructing payment state from events.
 * Providing event history per payment or merchant.
 
-This service demonstrates an event sourcing style approach.
+This service implements an **immutable event ledger with state reconstruction**.
 
-Instead of only storing the current payment state, it stores the sequence of events that happened during the payment lifecycle.
+Instead of only storing the current payment state, it stores the sequence of events that happened during the payment lifecycle and can reconstruct the latest state from that history.
 
 Example events:
 
@@ -517,49 +526,66 @@ The Payment Service is the main orchestrator of the platform.
 When a payment request is received, Payment Service coordinates merchant validation, fraud checking, provider authorization, event publishing, settlement processing, and notification creation.
 
 ```text
-1. React Dashboard sends a payment request to API Gateway.
+1. React Dashboard sends a payment request to API Gateway with:
+   - X-API-Key
+   - Idempotency-Key
 
 2. API Gateway routes the request to Payment Service.
 
-3. Payment Service validates the merchant API key by calling Merchant Service.
+3. Payment Service validates the idempotency key format.
 
-4. Merchant Service checks merchant data from PostgreSQL and may use Redis
+4. Payment Service validates the merchant API key by calling Merchant Service.
+
+5. Merchant Service checks merchant data from PostgreSQL and may use Redis
    for faster API key lookup.
 
-5. Payment Service sends the payment details to Fraud Service.
+6. Payment Service calculates a semantic SHA-256 fingerprint for the request
+   and atomically acquires the idempotency key in PostgreSQL.
 
-6. Fraud Service calculates a risk score and stores the fraud check result
-   in MongoDB.
+7. If the same key already exists:
+   - Same fingerprint + COMPLETED -> replay the stored PaymentResponse.
+   - Different fingerprint -> return 409 Conflict.
+   - Same fingerprint + PROCESSING -> return 409 Conflict.
 
-7. If the fraud decision is REJECTED:
-   - Payment Service marks the payment as failed.
-   - A PAYMENT_FAILED event is published to Kafka.
+8. The request that owns the idempotency key continues the payment flow.
 
-8. If the fraud decision is APPROVED or REVIEW:
-   - Payment Service continues with provider authorization.
+9. Payment Service sends the payment details to Fraud Service.
 
-9. Payment Service routes the request to one of the supported providers:
-   - MOCK_BANK
-   - LEGACY_BANK_SOAP
+10. Fraud Service calculates a risk score and stores the fraud check result
+    in MongoDB.
 
-10. If LEGACY_BANK_SOAP is selected, Payment Service calls the SOAP-based
+11. If the fraud decision is REJECTED:
+    - Payment Service marks the payment as failed.
+    - A PAYMENT_FAILED event is published to Kafka.
+
+12. If the fraud decision is APPROVED or REVIEW:
+    - Payment Service continues with provider authorization.
+
+13. Payment Service routes the request to one of the supported providers:
+    - MOCK_BANK
+    - LEGACY_BANK_SOAP
+
+14. If LEGACY_BANK_SOAP is selected, Payment Service calls the SOAP-based
     Legacy Bank SOAP Service.
 
-11. Payment Service stores the payment result in PostgreSQL.
+15. Payment Service stores the payment result in PostgreSQL.
 
-12. Payment Service publishes payment lifecycle events to Kafka.
+16. Payment Service marks the idempotency record as COMPLETED and stores
+    the payment ID and serialized response for future replay.
 
-13. Ledger Service consumes Kafka events and stores immutable event history.
+17. Payment Service publishes payment lifecycle events to Kafka.
 
-14. Settlement Service consumes authorized payment events and calculates
+18. Ledger Service consumes Kafka events and stores immutable event history.
+
+19. Settlement Service consumes authorized payment events and calculates
     merchant settlement amounts.
 
-15. Payment Service publishes a notification job to RabbitMQ.
+20. Payment Service publishes a notification job to RabbitMQ.
 
-16. Notification Service consumes the RabbitMQ message and stores the
+21. Notification Service consumes the RabbitMQ message and stores the
     notification result in PostgreSQL.
 
-17. React Dashboard fetches the payment result, ledger state, settlement,
+22. React Dashboard fetches the payment result, ledger state, settlement,
     fraud result, and notification logs through API Gateway.
 ```
 
@@ -586,21 +612,25 @@ The main payment flow works as follows:
 
 1. A merchant is created in Merchant Service.
 2. Merchant Service generates an API key.
-3. A payment request is sent through API Gateway.
-4. Payment Service receives the request.
-5. Payment Service validates the API key by calling Merchant Service.
-6. Payment Service calls Fraud Service for a risk check.
-7. If the fraud decision is rejected, the payment fails.
-8. If the fraud decision is approved or reviewable, Payment Service routes the request to a payment provider.
-9. If `MOCK_BANK` is selected, Payment Service uses internal mock authorization logic.
-10. If `LEGACY_BANK_SOAP` is selected, Payment Service calls the SOAP bank service.
-11. Payment Service stores the payment result.
-12. Payment Service publishes payment events to Kafka.
-13. Ledger Service consumes Kafka events and stores immutable payment event history.
-14. Settlement Service consumes authorized payment events and calculates merchant settlement.
-15. Payment Service publishes a notification job to RabbitMQ.
-16. Notification Service consumes the RabbitMQ message and stores notification logs.
-17. The React dashboard displays all related outputs.
+3. A payment request is sent through API Gateway with an `Idempotency-Key`.
+4. Payment Service validates the idempotency key and merchant API key.
+5. Payment Service calculates the request fingerprint and atomically acquires the idempotency key in PostgreSQL.
+6. A completed matching retry returns the previously stored response without repeating payment side effects.
+7. A changed payload using the same key is rejected with `409 Conflict`.
+8. A concurrent request using a key that is still `PROCESSING` is rejected with `409 Conflict`.
+9. The owning request calls Fraud Service for a risk check.
+10. If the fraud decision is rejected, the payment fails.
+11. If the fraud decision is approved or reviewable, Payment Service routes the request to a payment provider.
+12. If `MOCK_BANK` is selected, Payment Service uses internal mock authorization logic.
+13. If `LEGACY_BANK_SOAP` is selected, Payment Service calls the SOAP bank service.
+14. Payment Service stores the payment result.
+15. Payment Service completes the idempotency record with the payment ID and response body.
+16. Payment Service publishes payment events to Kafka.
+17. Ledger Service consumes Kafka events and stores immutable payment event history.
+18. Settlement Service consumes authorized payment events and calculates merchant settlement.
+19. Payment Service publishes a notification job to RabbitMQ.
+20. Notification Service consumes the RabbitMQ message and stores notification logs.
+21. The React dashboard displays all related outputs.
 
 ---
 
@@ -694,6 +724,16 @@ Why PostgreSQL?
 * Relational structure.
 * Transactional guarantees.
 * Suitable for payment, merchant, settlement, and notification records.
+* Supports atomic idempotency acquisition with `INSERT ... ON CONFLICT DO NOTHING`.
+* Provides database-level uniqueness for `(merchant_id, order_id)` as a final duplicate-order backstop.
+
+The Payment Service schema is versioned with Flyway. Current payment migrations establish:
+
+* The `payments` table.
+* A unique `(merchant_id, order_id)` constraint and merchant/date lookup index.
+* The `idempotency_records` table for durable request ownership, replay state, and completed responses.
+
+Hibernate schema management is configured for validation rather than runtime schema mutation.
 
 ---
 
@@ -720,6 +760,54 @@ Why Redis?
 * Redis provides fast key-value lookups.
 * It reduces repeated PostgreSQL queries.
 * It improves performance in a payment request path.
+
+---
+
+## Payment Idempotency
+
+`POST /api/payments/initiate` requires an `Idempotency-Key` header.
+
+The idempotency scope is:
+
+```text
+merchant_id + operation + idempotency_key
+```
+
+For payment initiation, the operation is:
+
+```text
+PAYMENT_INITIATION
+```
+
+PostgreSQL is the source of truth for correctness. Redis is not used as the authoritative idempotency store.
+
+### Request Fingerprint
+
+Payment Service calculates a semantic SHA-256 fingerprint from the request fields that define the logical payment:
+
+* Amount, normalized before hashing.
+* Currency, normalized to uppercase.
+* Order ID.
+* Card token.
+* Provider type.
+
+The merchant is scoped separately by the idempotency database key.
+
+### Request Behavior
+
+| Situation | Result |
+|---|---|
+| New key | Request acquires ownership and processing starts |
+| Same key + same request after completion | Stored `PaymentResponse` is replayed |
+| Same key + different request | `409 Conflict` |
+| Same key while the first request is still processing | `409 Conflict` |
+| Different merchants using the same key | Independent idempotency scopes |
+
+A successful idempotency record moves from `PROCESSING` to `COMPLETED` and stores the related payment ID and serialized response.
+
+For known-safe failures before provider authorization, such as duplicate order detection, the temporary `PROCESSING` reservation is released. If execution stops after an external provider outcome may already have occurred, the record is intentionally not automatically released because blindly retrying could create a duplicate authorization. Provider-side idempotency or reconciliation is a future reliability improvement.
+
+Idempotency protects HTTP retries, while the unique `(merchant_id, order_id)` constraint protects the separate business invariant that a merchant order must not create multiple payment records.
 
 ---
 
@@ -1089,6 +1177,7 @@ The response includes an API key. This key is required for payment initiation.
 POST http://localhost:8090/api/payments/initiate
 Content-Type: application/json
 X-API-Key: <merchant-api-key>
+Idempotency-Key: <unique-key-for-this-logical-payment>
 X-Forwarded-For: 192.168.1.77
 ```
 
@@ -1115,6 +1204,8 @@ Notification message is processed.
 Fraud check is stored.
 ```
 
+For a retry of the same logical payment, reuse the same `Idempotency-Key` and the same request body. After completion, Payment Service returns the stored response with the same payment ID instead of executing the provider flow again. A new logical payment must use a new idempotency key.
+
 ---
 
 ### Initiate Payment with Legacy SOAP Bank
@@ -1123,6 +1214,7 @@ Fraud check is stored.
 POST http://localhost:8090/api/payments/initiate
 Content-Type: application/json
 X-API-Key: <merchant-api-key>
+Idempotency-Key: <unique-key-for-this-logical-payment>
 X-Forwarded-For: 192.168.1.88
 ```
 
@@ -1262,7 +1354,15 @@ The API Gateway provides a single entry point for the frontend and hides interna
 
 ### Why use PostgreSQL for most services?
 
-Most business data in this system is transactional and relational. Merchant records, payments, settlements, ledger events, and notification logs benefit from relational consistency and structured queries.
+Most business data in this system is transactional and relational. Merchant records, payments, settlements, ledger events, notification logs, and idempotency records benefit from relational consistency and structured queries.
+
+---
+
+### Why use PostgreSQL-backed idempotency?
+
+Payment retries are a correctness problem, not only a caching problem. The idempotency record is therefore stored in PostgreSQL and acquired atomically with a unique key. This makes concurrent same-key requests deterministic and prevents an `exists()`-then-insert race.
+
+Redis remains useful for merchant API key caching, but it is not the source of truth for payment idempotency.
 
 ---
 
@@ -1304,12 +1404,17 @@ The project currently supports:
 * API key generation.
 * API key validation.
 * Payment initiation.
+* Required `Idempotency-Key` support for payment initiation.
+* PostgreSQL-backed semantic request fingerprinting and completed-response replay.
+* Concurrent same-key request protection.
+* Database-level duplicate order protection.
+* Flyway-managed Payment Service schema migrations.
 * Mock bank authorization.
 * Legacy SOAP bank authorization.
 * Fraud scoring.
 * Kafka event publishing.
 * Ledger event consumption.
-* Event based payment state reconstruction.
+* Immutable event ledger with payment state reconstruction.
 * Settlement calculation.
 * RabbitMQ notification processing.
 * Notification log storage.
@@ -1322,21 +1427,24 @@ The project currently supports:
 
 Potential future improvements:
 
-* Add centralized authentication with JWT.
-* Add role based access control.
+* Add a Transactional Outbox for reliable database-to-Kafka/RabbitMQ publication.
+* Add idempotent Kafka consumers and stronger consumer-side duplicate protection.
+* Add retry policies and dead letter queue handling.
+* Add Resilience4j timeouts, retries, and circuit breakers around synchronous integrations.
+* Add Testcontainers-based PostgreSQL and broker integration tests.
+* Add automated concurrency tests for payment idempotency.
+* Add contract testing between services.
 * Add distributed tracing with OpenTelemetry.
 * Add centralized logging with ELK or Loki.
 * Add Prometheus and Grafana monitoring.
-* Add Kubernetes deployment manifests.
+* Add k6 load and performance tests.
+* Add centralized authentication with JWT and role based access control.
+* Add rate limiting and broader security controls at API Gateway.
 * Add Jenkins or GitHub Actions CI/CD pipeline.
-* Add unit and integration tests.
-* Add contract testing between services.
-* Add retry and dead letter queue handling.
-* Add idempotency key support for payment requests.
-* Add real payment provider adapter interfaces.
-* Add admin dashboard features.
-* Add merchant specific reporting.
-* Add rate limiting at API Gateway.
+* Add Kubernetes deployment manifests.
+* Add real payment provider adapter interfaces and provider-side idempotency support.
+* Add reconciliation for uncertain external provider outcomes.
+* Add admin dashboard features and merchant specific reporting.
 * Add API documentation with OpenAPI aggregation.
 
 ---
@@ -1351,6 +1459,8 @@ The project includes:
 * REST and SOAP communication.
 * API Gateway routing.
 * PostgreSQL transactional persistence.
+* Flyway-managed relational schema migrations.
+* PostgreSQL-backed HTTP idempotency and replay protection.
 * MongoDB document persistence.
 * Redis caching.
 * Kafka based event driven processing.
