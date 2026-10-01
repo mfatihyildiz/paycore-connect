@@ -147,6 +147,16 @@ class PaymentPersistenceServiceTest {
         verify(paymentRepository, never()).saveAndFlush(any());
         verifyNoInteractions(paymentOutboxService);
     }
+    @Test
+    void createInitiatedPayment_shouldNotTranslateOutboxIntegrityFailureToDuplicateOrder() {
+        Payment payment = Payment.builder().id(UUID.randomUUID()).merchantId(UUID.randomUUID()).orderId("ORDER-1").build();
+
+        when(paymentRepository.saveAndFlush(payment)).thenReturn(payment);
+        DataIntegrityViolationException outboxFailure = new DataIntegrityViolationException("outbox constraint violation");
+        doThrow(outboxFailure).when(paymentOutboxService).enqueuePaymentEvent(payment);
+        assertThatThrownBy(() -> paymentPersistenceService.createInitiatedPayment(payment)).isSameAs(outboxFailure);
+    }
+
 
     private Payment createPayment(UUID id, PaymentStatus status) {
         return Payment.builder()

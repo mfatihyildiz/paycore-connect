@@ -21,13 +21,16 @@ public class PaymentPersistenceService {
 
     @Transactional
     public Payment createInitiatedPayment(Payment payment) {
+        final Payment savedPayment;
+
         try {
-            Payment savedPayment = paymentRepository.saveAndFlush(payment);
-            paymentOutboxService.enqueuePaymentEvent(savedPayment);
-            return savedPayment;
+            savedPayment = paymentRepository.saveAndFlush(payment);
         } catch (DataIntegrityViolationException exception) {
             throw new DuplicateOrderException(payment.getMerchantId(), payment.getOrderId());
         }
+
+        paymentOutboxService.enqueuePaymentEvent(savedPayment);
+        return savedPayment;
     }
 
     @Transactional
