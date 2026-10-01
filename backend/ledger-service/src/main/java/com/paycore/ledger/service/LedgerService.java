@@ -4,6 +4,7 @@ import com.paycore.ledger.domain.PaymentLedgerEvent;
 import com.paycore.ledger.dto.PaymentLedgerEventResponse;
 import com.paycore.ledger.event.PaymentEvent;
 import com.paycore.ledger.repository.PaymentLedgerEventRepository;
+import com.paycore.ledger.repository.PaymentLedgerEventWriter;
 import lombok.RequiredArgsConstructor;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
@@ -19,14 +20,12 @@ import java.util.UUID;
 public class LedgerService {
 
     private final PaymentLedgerEventRepository paymentLedgerEventRepository;
+    private final PaymentLedgerEventWriter paymentLedgerEventWriter;
 
     @Transactional
     public void savePaymentEvent(PaymentEvent event) {
-        if (paymentLedgerEventRepository.existsByEventId(event.eventId())) {
-            return;
-        }
-
         PaymentLedgerEvent ledgerEvent = PaymentLedgerEvent.builder()
+                .id(UUID.randomUUID())
                 .eventId(event.eventId())
                 .eventType(event.eventType())
                 .paymentId(event.paymentId())
@@ -43,7 +42,7 @@ public class LedgerService {
                 .consumedAt(LocalDateTime.now())
                 .build();
 
-        paymentLedgerEventRepository.save(ledgerEvent);
+        paymentLedgerEventWriter.insertIfAbsent(ledgerEvent);
     }
 
     @Transactional(readOnly = true)

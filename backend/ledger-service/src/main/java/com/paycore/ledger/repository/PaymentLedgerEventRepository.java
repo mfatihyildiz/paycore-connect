@@ -8,8 +8,6 @@ import java.util.UUID;
 
 public interface PaymentLedgerEventRepository extends JpaRepository<PaymentLedgerEvent, UUID> {
 
-    boolean existsByEventId(UUID eventId);
-
     List<PaymentLedgerEvent> findByPaymentIdOrderByOccurredAtAsc(UUID paymentId);
 
     List<PaymentLedgerEvent> findByMerchantIdOrderByOccurredAtDesc(UUID merchantId);

@@ -10,6 +10,7 @@ import java.util.UUID;
 
 import static org.mockito.ArgumentMatchers.isNull;
 import static org.mockito.Mockito.*;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 class PaymentEventConsumerTest {
 
@@ -38,6 +39,18 @@ class PaymentEventConsumerTest {
 
         verify(ledgerService).savePaymentEvent(isNull());
         verifyNoMoreInteractions(ledgerService);
+    }
+
+    @Test
+    void consumePaymentEvent_shouldPropagateException_whenLedgerProcessingFails() {
+        PaymentEvent event = createPaymentEvent();
+        RuntimeException processingFailure = new RuntimeException("Database unavailable");
+
+        doThrow(processingFailure).when(ledgerService).savePaymentEvent(event);
+
+        assertThatThrownBy(() -> paymentEventConsumer.consumePaymentEvent(event)).isSameAs(processingFailure);
+
+        verify(ledgerService).savePaymentEvent(event);
     }
 
     private PaymentEvent createPaymentEvent() {

@@ -6,6 +6,7 @@ import com.paycore.ledger.dto.PaymentLedgerStateResponse;
 import com.paycore.ledger.event.PaymentEvent;
 import com.paycore.ledger.exception.PaymentLedgerNotFoundException;
 import com.paycore.ledger.repository.PaymentLedgerEventRepository;
+import com.paycore.ledger.repository.PaymentLedgerEventWriter;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
@@ -28,36 +29,30 @@ class LedgerServiceTest {
     @Mock
     private PaymentLedgerEventRepository paymentLedgerEventRepository;
 
+    @Mock
+    private PaymentLedgerEventWriter paymentLedgerEventWriter;
+
     private LedgerService ledgerService;
 
     @BeforeEach
     void setUp() {
-        ledgerService = new LedgerService(paymentLedgerEventRepository);
+        ledgerService = new LedgerService(paymentLedgerEventRepository, paymentLedgerEventWriter);
     }
 
     @Test
-    void savePaymentEvent_shouldSaveLedgerEvent_whenEventIsNotAlreadyConsumed() {
-        PaymentEvent event = createPaymentEvent(
-                "PAYMENT_INITIATED",
-                "INITIATED",
-                LocalDateTime.now()
-        );
+    void savePaymentEvent_shouldInsertLedgerEvent_whenEventIsNew() {
+        PaymentEvent event = createPaymentEvent("PAYMENT_INITIATED", "INITIATED", LocalDateTime.now());
 
-        when(paymentLedgerEventRepository.existsByEventId(event.eventId()))
-                .thenReturn(false);
-
-        when(paymentLedgerEventRepository.save(any(PaymentLedgerEvent.class)))
-                .thenAnswer(invocation -> invocation.getArgument(0));
+        when(paymentLedgerEventWriter.insertIfAbsent(any(PaymentLedgerEvent.class))).thenReturn(true);
 
         ledgerService.savePaymentEvent(event);
 
-        ArgumentCaptor<PaymentLedgerEvent> captor =
-                ArgumentCaptor.forClass(PaymentLedgerEvent.class);
+        ArgumentCaptor<PaymentLedgerEvent> eventCaptor = ArgumentCaptor.forClass(PaymentLedgerEvent.class);
+        verify(paymentLedgerEventWriter).insertIfAbsent(eventCaptor.capture());
 
-        verify(paymentLedgerEventRepository).save(captor.capture());
+        PaymentLedgerEvent savedEvent = eventCaptor.getValue();
 
-        PaymentLedgerEvent savedEvent = captor.getValue();
-
+        assertThat(savedEvent.getId()).isNotNull();
         assertThat(savedEvent.getEventId()).isEqualTo(event.eventId());
         assertThat(savedEvent.getEventType()).isEqualTo(event.eventType());
         assertThat(savedEvent.getPaymentId()).isEqualTo(event.paymentId());
@@ -75,20 +70,14 @@ class LedgerServiceTest {
     }
 
     @Test
-    void savePaymentEvent_shouldIgnoreEvent_whenEventAlreadyExists() {
-        PaymentEvent event = createPaymentEvent(
-                "PAYMENT_AUTHORIZED",
-                "AUTHORIZED",
-                LocalDateTime.now()
-        );
+    void savePaymentEvent_shouldCompleteNormally_whenEventIsDuplicate() {
+        PaymentEvent event = createPaymentEvent("PAYMENT_AUTHORIZED", "AUTHORIZED", LocalDateTime.now());
 
-        when(paymentLedgerEventRepository.existsByEventId(event.eventId()))
-                .thenReturn(true);
+        when(paymentLedgerEventWriter.insertIfAbsent(any(PaymentLedgerEvent.class))).thenReturn(false);
 
         ledgerService.savePaymentEvent(event);
 
-        verify(paymentLedgerEventRepository).existsByEventId(event.eventId());
-        verify(paymentLedgerEventRepository, never()).save(any(PaymentLedgerEvent.class));
+        verify(paymentLedgerEventWriter).insertIfAbsent(any(PaymentLedgerEvent.class));
     }
 
     @Test
