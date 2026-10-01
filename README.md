@@ -4,7 +4,7 @@
 
 The project simulates a real world payment infrastructure where merchants can initiate payments, validate API keys, route payment requests to mock or legacy banking providers, run fraud checks, publish payment events, create ledger records, calculate settlements, and generate notification logs.
 
-The main purpose of this project is to demonstrate a production oriented backend architecture using synchronous and asynchronous communication patterns, multiple persistence technologies, API Gateway routing, event driven processing, SOAP integration, database migrations, PostgreSQL backed HTTP idempotency, and a React based dashboard.
+The main purpose of this project is to demonstrate a production oriented backend architecture using synchronous and asynchronous communication patterns, multiple persistence technologies, API Gateway routing, event driven processing, SOAP integration, Flyway database migrations, PostgreSQL backed HTTP idempotency, transactional outbox messaging, broker outage recovery, and a React based dashboard.
 
 ---
 
@@ -19,6 +19,7 @@ The main purpose of this project is to demonstrate a production oriented backend
 * [Communication Patterns](#communication-patterns)
 * [Data Storage Design](#data-storage-design)
 * [Payment Idempotency](#payment-idempotency)
+* [Transactional Outbox](#transactional-outbox)
 * [Event-Driven Architecture](#event-driven-architecture)
 * [Fraud Detection Flow](#fraud-detection-flow)
 * [SOAP Legacy Bank Integration](#soap-legacy-bank-integration)
@@ -49,18 +50,19 @@ The system allows merchants to:
 * Safely retry the same logical payment request without creating duplicate payments.
 * Route payments to different payment providers.
 * Run fraud checks before authorization.
-* Store payment records.
-* Publish domain events to Kafka.
+* Store payment state and asynchronous broker messages atomically in PostgreSQL.
+* Publish payment domain events to Kafka through a transactional outbox relay.
 * Consume payment events for ledger and settlement processes.
-* Send asynchronous notification jobs through RabbitMQ.
+* Publish notification jobs to RabbitMQ through the same outbox mechanism.
+* Recover pending broker messages automatically after Kafka or RabbitMQ outages.
 * Monitor the full flow from a React dashboard.
 
 The platform includes both synchronous and asynchronous communication:
 
 * **Synchronous REST calls** are used when an immediate response is required.
 * **SOAP calls** are used to simulate legacy bank integration.
-* **Kafka events** are used for event driven ledger and settlement processing.
-* **RabbitMQ messages** are used for asynchronous notification processing.
+* **Kafka events** are used for event driven ledger and settlement processing and are published asynchronously from the PostgreSQL transactional outbox.
+* **RabbitMQ messages** are used for asynchronous notification processing and are published through the same durable outbox relay.
 
 ---
 
@@ -189,19 +191,24 @@ It is responsible for:
 * Calling Fraud Service before payment authorization.
 * Routing payments to the selected provider.
 * Supporting mock and legacy SOAP bank providers.
-* Persisting payment data.
+* Persisting payment state in PostgreSQL.
 * Enforcing one payment per `(merchant_id, order_id)` business key.
-* Publishing payment events to Kafka.
-* Publishing notification messages to RabbitMQ.
+* Persisting Kafka and RabbitMQ messages into a transactional outbox in the same database transaction as payment state changes.
+* Claiming and publishing pending outbox rows asynchronously.
+* Preserving same-payment Kafka lifecycle ordering.
+* Retrying broker failures with exponential backoff and durable retry metadata.
+* Recovering stale publisher claims after a publisher crash or interruption.
 
 This service uses:
 
-* **PostgreSQL** for payment transaction records and durable idempotency state.
+* **PostgreSQL** for payment transaction records, durable idempotency state, and transactional outbox rows.
 * **Flyway** for versioned payment database migrations.
 * **REST** for merchant validation and fraud checks.
 * **SOAP** for legacy bank authorization.
 * **Kafka** for payment domain events.
 * **RabbitMQ** for asynchronous notification jobs.
+
+Kafka and RabbitMQ are not part of the request transaction. The request path commits payment state and outbox records first; a scheduled outbox publisher performs broker I/O afterwards.
 
 Supported provider types:
 
@@ -464,7 +471,7 @@ The system is designed around the following architectural layers:
 |                              Core Business Layer                                 |
 |----------------------------------------------------------------------------------|
 | Merchant Service        | Manages merchants, API keys, and merchant status        |
-| Payment Service         | Orchestrates payment authorization flow                 |
+| Payment Service         | Orchestrates payments and durable outbox publication    |
 | Fraud Service           | Evaluates payment risk and stores fraud check results   |
 | Ledger Service          | Stores immutable payment event history                  |
 | Settlement Service      | Calculates merchant payouts from authorized payments    |
@@ -476,7 +483,7 @@ The system is designed around the following architectural layers:
 +----------------------------------------------------------------------------------+
 |                            Infrastructure Layer                                  |
 |----------------------------------------------------------------------------------|
-| PostgreSQL | Relational storage for merchants, payments, ledger, settlements, logs |
+| PostgreSQL | Relational storage for merchants, payments, outbox, ledger, settlements, logs |
 | MongoDB    | Document storage for fraud check records and risk metadata           |
 | Redis      | API key cache for fast merchant validation                           |
 | Kafka      | Event streaming for payment lifecycle events                         |
@@ -523,7 +530,7 @@ http://localhost:8090
 
 The Payment Service is the main orchestrator of the platform.
 
-When a payment request is received, Payment Service coordinates merchant validation, fraud checking, provider authorization, event publishing, settlement processing, and notification creation.
+When a payment request is received, Payment Service coordinates durable HTTP idempotency, merchant validation, payment persistence, fraud checking, provider authorization, transactional outbox creation, and asynchronous broker publication.
 
 ```text
 1. React Dashboard sends a payment request to API Gateway with:
@@ -547,46 +554,57 @@ When a payment request is received, Payment Service coordinates merchant validat
    - Different fingerprint -> return 409 Conflict.
    - Same fingerprint + PROCESSING -> return 409 Conflict.
 
-8. The request that owns the idempotency key continues the payment flow.
+8. The owning request persists the INITIATED payment and a PAYMENT_INITIATED
+   Kafka outbox row in the same short PostgreSQL transaction.
 
-9. Payment Service sends the payment details to Fraud Service.
+9. Payment Service sends the payment details to Fraud Service outside that
+   database transaction.
 
 10. Fraud Service calculates a risk score and stores the fraud check result
     in MongoDB.
 
 11. If the fraud decision is REJECTED:
-    - Payment Service marks the payment as failed.
-    - A PAYMENT_FAILED event is published to Kafka.
+    - Payment Service finalizes the payment as FAILED.
+    - The same PostgreSQL transaction stores the final Kafka event and
+      RabbitMQ notification outbox rows.
 
 12. If the fraud decision is APPROVED or REVIEW:
-    - Payment Service continues with provider authorization.
+    - Payment Service calls the selected payment provider outside the
+      database transaction.
 
-13. Payment Service routes the request to one of the supported providers:
-    - MOCK_BANK
-    - LEGACY_BANK_SOAP
+13. Payment Service finalizes the payment as AUTHORIZED or FAILED.
+    The final payment state, final Kafka event, and notification outbox row
+    are committed atomically in PostgreSQL.
 
-14. If LEGACY_BANK_SOAP is selected, Payment Service calls the SOAP-based
-    Legacy Bank SOAP Service.
-
-15. Payment Service stores the payment result in PostgreSQL.
-
-16. Payment Service marks the idempotency record as COMPLETED and stores
+14. Payment Service marks the idempotency record as COMPLETED and stores
     the payment ID and serialized response for future replay.
 
-17. Payment Service publishes payment lifecycle events to Kafka.
+15. The HTTP request can return successfully without waiting for Kafka or
+    RabbitMQ broker availability.
 
-18. Ledger Service consumes Kafka events and stores immutable event history.
+16. The scheduled outbox publisher selects eligible PENDING rows using
+    FOR UPDATE SKIP LOCKED and moves them to PROCESSING with a lease owner.
 
-19. Settlement Service consumes authorized payment events and calculates
-    merchant settlement amounts.
+17. The publisher sends the exact JSON payload already stored in the outbox.
 
-20. Payment Service publishes a notification job to RabbitMQ.
+18. Kafka publication is considered successful after the send future succeeds.
+    RabbitMQ publication requires a positive publisher confirm and no
+    mandatory returned message.
 
-21. Notification Service consumes the RabbitMQ message and stores the
-    notification result in PostgreSQL.
+19. Successful rows become PUBLISHED. Failed rows return to PENDING with
+    attempt_count, last_attempt_at, next_attempt_at, and last_error updated.
 
-22. React Dashboard fetches the payment result, ledger state, settlement,
-    fraud result, and notification logs through API Gateway.
+20. Retry delays use exponential backoff, and stale PROCESSING claims can
+    be recovered after the configured lease timeout.
+
+21. Same-payment Kafka lifecycle ordering is preserved so PAYMENT_INITIATED
+    is published before the later PAYMENT_AUTHORIZED or PAYMENT_FAILED event.
+
+22. Ledger and Settlement consume Kafka events; Notification Service consumes
+    RabbitMQ notification messages.
+
+23. React Dashboard fetches payment, ledger, settlement, fraud, and
+    notification outputs through API Gateway.
 ```
 
 ---
@@ -597,7 +615,7 @@ When a payment request is received, Payment Service coordinates merchant validat
 | ------------------------ | ------------------------------------------------ | --------------------------- | --------------------------------------------- |
 | API Gateway              | Routes frontend requests to backend services     | None                        | HTTP                                          |
 | Merchant Service         | Merchant management and API key validation       | PostgreSQL, Redis           | REST                                          |
-| Payment Service          | Main payment orchestration                       | PostgreSQL, Kafka, RabbitMQ | REST, SOAP, Kafka producer, RabbitMQ producer |
+| Payment Service          | Payment orchestration and transactional outbox relay | PostgreSQL, Kafka, RabbitMQ | REST, SOAP, asynchronous Kafka/RabbitMQ publication |
 | Fraud Service            | Risk scoring and fraud check persistence         | MongoDB                     | REST                                          |
 | Legacy Bank SOAP Service | Simulated legacy bank authorization              | None                        | SOAP                                          |
 | Ledger Service           | Immutable event history and state reconstruction | PostgreSQL, Kafka           | Kafka consumer, REST                          |
@@ -618,19 +636,20 @@ The main payment flow works as follows:
 6. A completed matching retry returns the previously stored response without repeating payment side effects.
 7. A changed payload using the same key is rejected with `409 Conflict`.
 8. A concurrent request using a key that is still `PROCESSING` is rejected with `409 Conflict`.
-9. The owning request calls Fraud Service for a risk check.
-10. If the fraud decision is rejected, the payment fails.
-11. If the fraud decision is approved or reviewable, Payment Service routes the request to a payment provider.
-12. If `MOCK_BANK` is selected, Payment Service uses internal mock authorization logic.
-13. If `LEGACY_BANK_SOAP` is selected, Payment Service calls the SOAP bank service.
-14. Payment Service stores the payment result.
+9. Payment Service persists the initiated payment and `PAYMENT_INITIATED` outbox row atomically.
+10. The owning request calls Fraud Service for a risk check.
+11. If fraud rejects the payment, Payment Service finalizes it as `FAILED` and atomically stores the final event and notification outbox rows.
+12. Otherwise Payment Service routes the request to `MOCK_BANK` or `LEGACY_BANK_SOAP`.
+13. The provider call runs outside the database transaction.
+14. Payment Service finalizes the payment as `AUTHORIZED` or `FAILED` and atomically stores the corresponding Kafka event and RabbitMQ notification in the outbox.
 15. Payment Service completes the idempotency record with the payment ID and response body.
-16. Payment Service publishes payment events to Kafka.
-17. Ledger Service consumes Kafka events and stores immutable payment event history.
-18. Settlement Service consumes authorized payment events and calculates merchant settlement.
-19. Payment Service publishes a notification job to RabbitMQ.
-20. Notification Service consumes the RabbitMQ message and stores notification logs.
-21. The React dashboard displays all related outputs.
+16. The HTTP request completes without waiting for broker publication.
+17. The outbox publisher asynchronously claims eligible rows and publishes their stored payloads to Kafka or RabbitMQ.
+18. Successful broker acknowledgments move rows to `PUBLISHED`; failures are retried with durable metadata and exponential backoff.
+19. Ledger Service consumes Kafka events and stores immutable payment event history.
+20. Settlement Service consumes authorized payment events and calculates merchant settlement.
+21. Notification Service consumes RabbitMQ messages and stores notification logs.
+22. The React dashboard displays all related outputs.
 
 ---
 
@@ -669,17 +688,46 @@ This demonstrates how a modern microservice can integrate with an older enterpri
 
 ---
 
+### Transactional Outbox Communication
+
+Payment Service does not perform a database write and broker publish as one fragile dual-write operation.
+
+Instead, payment state and the logical broker message are committed together in PostgreSQL:
+
+```text
+Payment transaction
+      |
+      +--> payments
+      |
+      +--> outbox_events
+      |
+      v
+PostgreSQL COMMIT
+      |
+      v
+Outbox Publisher
+   |          |
+   v          v
+ Kafka    RabbitMQ
+```
+
+The publisher performs network calls after the database transaction has completed. Broker outages therefore do not roll back an already authorized payment.
+
+---
+
 ### Kafka Communication
 
-Kafka is used for event driven processing.
+Kafka is used for payment domain events.
 
 Used for:
 
 ```text
-Payment Service -> Kafka payment-events topic
+Payment Service outbox -> Kafka payment-events topic
 Kafka payment-events topic -> Ledger Service
 Kafka payment-events topic -> Settlement Service
 ```
+
+The outbox publisher uses the payment ID as the Kafka message key and sends the exact serialized event payload stored at outbox creation time. It waits for the Kafka send result before marking the row `PUBLISHED`.
 
 Kafka is suitable because ledger and settlement operations should react to payment events without tightly coupling themselves to Payment Service.
 
@@ -687,14 +735,16 @@ Kafka is suitable because ledger and settlement operations should react to payme
 
 ### RabbitMQ Communication
 
-RabbitMQ is used for background job processing.
+RabbitMQ is used for background notification jobs.
 
 Used for:
 
 ```text
-Payment Service -> RabbitMQ notification queue
+Payment Service outbox -> RabbitMQ notification exchange / queue
 RabbitMQ notification queue -> Notification Service
 ```
+
+The publisher sends persistent JSON messages, uses the outbox event ID as correlation data, requires a positive publisher confirm, and treats mandatory returned messages as publication failures.
 
 RabbitMQ is suitable for notification delivery because it is a task oriented asynchronous workload.
 
@@ -732,6 +782,10 @@ The Payment Service schema is versioned with Flyway. Current payment migrations 
 * The `payments` table.
 * A unique `(merchant_id, order_id)` constraint and merchant/date lookup index.
 * The `idempotency_records` table for durable request ownership, replay state, and completed responses.
+* The `outbox_events` table for durable Kafka and RabbitMQ messages.
+* Outbox destination metadata, stable payload storage, and `PENDING` / `PROCESSING` / `PUBLISHED` lifecycle state.
+* Claim/lease fields (`processing_started_at`, `lock_owner`) for concurrent-safe publication and stale claim recovery.
+* Retry metadata (`attempt_count`, `last_attempt_at`, `next_attempt_at`, `last_error`) for controlled exponential backoff.
 
 Hibernate schema management is configured for validation rather than runtime schema mutation.
 
@@ -811,9 +865,101 @@ Idempotency protects HTTP retries, while the unique `(merchant_id, order_id)` co
 
 ---
 
+## Transactional Outbox
+
+The Payment Service uses a PostgreSQL backed transactional outbox to reliably bridge payment database state and asynchronous broker publication.
+
+Without an outbox, a request could save the payment successfully and fail before Kafka/RabbitMQ publication, or publish successfully and fail before the database update. The outbox removes the first database-to-broker dual-write by storing the logical message in the same transaction as the payment state change.
+
+### Atomic Persistence
+
+For the initiated state:
+
+```text
+BEGIN
+  save PAYMENT_INITIATED state
+  save PAYMENT_INITIATED outbox event
+COMMIT
+```
+
+For the final state:
+
+```text
+BEGIN
+  update payment to AUTHORIZED / FAILED
+  save final Kafka outbox event
+  save RabbitMQ notification outbox event
+COMMIT
+```
+
+External fraud and provider calls are kept outside these short database transactions.
+
+### Stable Stored Payload
+
+The event or notification payload is serialized once when the outbox row is created. The outbox row ID is also used as the logical event/notification ID.
+
+Retries therefore publish the same stored JSON and the same logical ID rather than reconstructing a new message from mutable payment state.
+
+### Claim and Lease Lifecycle
+
+Outbox rows move through:
+
+```text
+PENDING -> PROCESSING -> PUBLISHED
+```
+
+Eligible rows are claimed in short PostgreSQL transactions using `FOR UPDATE SKIP LOCKED`. A claimed row stores `lock_owner` and `processing_started_at`. Broker network I/O happens after the claim transaction has completed.
+
+If a publisher crashes after claiming a row, stale `PROCESSING` rows are returned to `PENDING` after the configured lease timeout.
+
+### Retry and Exponential Backoff
+
+Failed publications are not retried in a tight scheduler loop. The row returns to `PENDING` with:
+
+* `attempt_count`
+* `last_attempt_at`
+* `next_attempt_at`
+* `last_error`
+
+The verified default retry progression is based on a 5 second base delay and is capped at 60 seconds.
+
+Only rows whose `next_attempt_at` is due are claimable again.
+
+### Ordering
+
+For the same payment and Kafka destination, a later lifecycle event cannot be claimed while an earlier event is still not `PUBLISHED`.
+
+This preserves:
+
+```text
+PAYMENT_INITIATED
+        |
+        v
+PAYMENT_AUTHORIZED / PAYMENT_FAILED
+```
+
+RabbitMQ notification publication is independent because it uses a different destination.
+
+### Broker Failure Isolation
+
+Manual Docker E2E tests verified both failure domains:
+
+* With Kafka unavailable, the payment request still returned `201 Created` / `AUTHORIZED`, the Kafka outbox rows remained durable, and the RabbitMQ notification could still publish.
+* After Kafka recovered, pending Kafka rows were published automatically without resubmitting the payment request.
+* With RabbitMQ unavailable, Kafka events still published successfully while the notification row remained retryable.
+* After RabbitMQ recovered, the notification was published automatically.
+
+### Delivery Semantics
+
+The outbox provides **at-least-once** publication semantics.
+
+A broker may accept a message and the application may fail before PostgreSQL records the row as `PUBLISHED`. That message can therefore be delivered again on retry. Consumer-side idempotency is the next reliability layer and remains a separate development phase.
+
+---
+
 ## Event Driven Architecture
 
-Payment Service publishes events to Kafka whenever an important payment lifecycle change occurs.
+Payment lifecycle events are created as immutable outbox messages whenever an important payment state transition is committed.
 
 Example event types:
 
@@ -822,6 +968,8 @@ PAYMENT_INITIATED
 PAYMENT_AUTHORIZED
 PAYMENT_FAILED
 ```
+
+The event JSON is serialized once during outbox creation. A scheduled publisher later sends the stored payload to Kafka and marks the row `PUBLISHED` only after the Kafka send succeeds.
 
 ### Ledger Service Event Consumption
 
@@ -853,6 +1001,8 @@ For authorized payments, it calculates:
 * Merchant payout data
 
 Failed payments do not generate settlement records.
+
+Because outbox delivery is at-least-once, consumer duplicate protection is treated as a separate reliability concern and is listed in Future Improvements.
 
 ---
 
@@ -1197,9 +1347,11 @@ Expected result:
 
 ```text
 Payment is authorized through mock provider.
-Kafka events are published.
+Payment state and outbox messages are committed to PostgreSQL.
+Kafka events are published asynchronously from the outbox.
 Ledger state is created.
 Settlement is calculated.
+RabbitMQ notification is published asynchronously from the outbox.
 Notification message is processed.
 Fraud check is stored.
 ```
@@ -1235,7 +1387,8 @@ Expected result:
 ```text
 Payment Service calls Legacy Bank SOAP Service.
 SOAP authorization result is stored.
-Kafka and RabbitMQ flows continue after provider response.
+Payment state and outbox rows are committed.
+Kafka and RabbitMQ publication continues asynchronously through the outbox relay.
 ```
 
 ---
@@ -1342,6 +1495,19 @@ http://localhost:8090
 
 This is because the React code runs in the user's browser, not inside the Docker network.
 
+Payment Service outbox behavior can be tuned with environment variables:
+
+```text
+OUTBOX_BATCH_SIZE=10
+OUTBOX_POLL_INTERVAL_MS=1000
+OUTBOX_LEASE_TIMEOUT_SECONDS=120
+OUTBOX_PUBLISH_TIMEOUT_SECONDS=5
+OUTBOX_RETRY_BASE_DELAY_SECONDS=5
+OUTBOX_RETRY_MAX_DELAY_SECONDS=60
+```
+
+These values control batch claiming, scheduler cadence, stale lease recovery, broker wait time, and exponential retry backoff.
+
 ---
 
 ## Design Decisions
@@ -1363,6 +1529,16 @@ Most business data in this system is transactional and relational. Merchant reco
 Payment retries are a correctness problem, not only a caching problem. The idempotency record is therefore stored in PostgreSQL and acquired atomically with a unique key. This makes concurrent same-key requests deterministic and prevents an `exists()`-then-insert race.
 
 Redis remains useful for merchant API key caching, but it is not the source of truth for payment idempotency.
+
+---
+
+### Why use a Transactional Outbox?
+
+Payment persistence and broker publication cannot be made atomic with a normal local database transaction. Publishing directly after a database write creates a dual-write failure window.
+
+The transactional outbox stores the logical Kafka/RabbitMQ message in PostgreSQL together with the payment state change. A separate publisher then performs broker I/O, allowing payment correctness to remain independent from temporary Kafka or RabbitMQ outages.
+
+The relay uses short claim transactions, stale lease recovery, broker acknowledgments, stable stored payloads, and exponential retry backoff. Its delivery model is deliberately at-least-once, so downstream consumer idempotency remains important.
 
 ---
 
@@ -1412,8 +1588,18 @@ The project currently supports:
 * Mock bank authorization.
 * Legacy SOAP bank authorization.
 * Fraud scoring.
-* Kafka event publishing.
-* Ledger event consumption.
+* Transactional Outbox for reliable PostgreSQL-to-Kafka/RabbitMQ publication.
+* Atomic payment-state and outbox persistence.
+* Stable serialized event/message payloads and logical IDs across retries.
+* Outbox claim/lease handling with `FOR UPDATE SKIP LOCKED`.
+* Stale claim recovery.
+* Same-payment Kafka lifecycle ordering.
+* Kafka send acknowledgment before marking an event `PUBLISHED`.
+* RabbitMQ publisher confirms and mandatory-return handling.
+* Durable retry metadata and exponential backoff.
+* Kafka outage recovery without losing payment events.
+* RabbitMQ outage recovery without coupling broker availability to payment success.
+* Kafka event consumption.
 * Immutable event ledger with payment state reconstruction.
 * Settlement calculation.
 * RabbitMQ notification processing.
@@ -1427,11 +1613,12 @@ The project currently supports:
 
 Potential future improvements:
 
-* Add a Transactional Outbox for reliable database-to-Kafka/RabbitMQ publication.
-* Add idempotent Kafka consumers and stronger consumer-side duplicate protection.
-* Add retry policies and dead letter queue handling.
+* Add database-enforced idempotent consumers and stronger duplicate protection for ledger, settlement, and notification processing.
+* Add concurrency tests for duplicate consumer deliveries against real databases.
+* Add dead letter handling for terminal or non-retriable messaging failures.
 * Add Resilience4j timeouts, retries, and circuit breakers around synchronous integrations.
-* Add Testcontainers-based PostgreSQL and broker integration tests.
+* Add Testcontainers-based PostgreSQL, Kafka, RabbitMQ, Redis, and MongoDB integration tests.
+* Automate Kafka/RabbitMQ outage and recovery scenarios in CI.
 * Add automated concurrency tests for payment idempotency.
 * Add contract testing between services.
 * Add distributed tracing with OpenTelemetry.
@@ -1461,9 +1648,15 @@ The project includes:
 * PostgreSQL transactional persistence.
 * Flyway-managed relational schema migrations.
 * PostgreSQL-backed HTTP idempotency and replay protection.
+* Transactional Outbox based database-to-broker delivery.
+* Durable outbox claim/lease and stale recovery.
+* Kafka and RabbitMQ broker acknowledgment handling.
+* Exponential broker retry backoff with persisted attempt metadata.
+* Broker outage recovery with at-least-once publication semantics.
 * MongoDB document persistence.
 * Redis caching.
 * Kafka based event driven processing.
+* Immutable event ledger with state reconstruction.
 * RabbitMQ based asynchronous job processing.
 * React dashboard.
 * Docker Compose orchestration.
