@@ -8,8 +8,12 @@ import java.math.BigDecimal;
 import java.time.LocalDateTime;
 import java.util.UUID;
 
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.ArgumentMatchers.isNull;
-import static org.mockito.Mockito.*;
+import static org.mockito.Mockito.doThrow;
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.verifyNoMoreInteractions;
 
 class PaymentEventConsumerTest {
 
@@ -37,6 +41,19 @@ class PaymentEventConsumerTest {
         paymentEventConsumer.consumePaymentEvent(null);
 
         verify(settlementService).processPaymentEvent(isNull());
+        verifyNoMoreInteractions(settlementService);
+    }
+
+    @Test
+    void consumePaymentEvent_shouldPropagateException_whenSettlementProcessingFails() {
+        PaymentEvent event = createPaymentEvent();
+        RuntimeException processingFailure = new RuntimeException("Database unavailable");
+
+        doThrow(processingFailure).when(settlementService).processPaymentEvent(event);
+
+        assertThatThrownBy(() -> paymentEventConsumer.consumePaymentEvent(event)).isSameAs(processingFailure);
+
+        verify(settlementService).processPaymentEvent(event);
         verifyNoMoreInteractions(settlementService);
     }
 

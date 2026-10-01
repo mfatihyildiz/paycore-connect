@@ -9,10 +9,6 @@ import java.util.UUID;
 
 public interface SettlementRepository extends JpaRepository<Settlement, UUID> {
 
-    boolean existsByEventId(UUID eventId);
-
-    boolean existsByPaymentId(UUID paymentId);
-
     Optional<Settlement> findByPaymentId(UUID paymentId);
 
     List<Settlement> findByMerchantIdOrderByCreatedAtDesc(UUID merchantId);

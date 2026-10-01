@@ -7,6 +7,7 @@ import com.paycore.settlement.dto.SettlementResponse;
 import com.paycore.settlement.event.PaymentEvent;
 import com.paycore.settlement.exception.SettlementNotFoundException;
 import com.paycore.settlement.repository.SettlementRepository;
+import com.paycore.settlement.repository.SettlementWriter;
 import lombok.RequiredArgsConstructor;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
@@ -15,6 +16,7 @@ import org.springframework.transaction.annotation.Transactional;
 import java.math.BigDecimal;
 import java.math.RoundingMode;
 import java.time.LocalDate;
+import java.time.LocalDateTime;
 import java.util.List;
 import java.util.UUID;
 
@@ -25,6 +27,7 @@ public class SettlementService {
     private static final String AUTHORIZED_EVENT_TYPE = "PAYMENT_AUTHORIZED";
 
     private final SettlementRepository settlementRepository;
+    private final SettlementWriter settlementWriter;
 
     @Value("${paycore.settlement.commission-rate}")
     private BigDecimal commissionRate;
@@ -35,21 +38,14 @@ public class SettlementService {
             return;
         }
 
-        if (settlementRepository.existsByEventId(event.eventId())
-                || settlementRepository.existsByPaymentId(event.paymentId())) {
-            return;
-        }
-
         BigDecimal grossAmount = event.amount().setScale(2, RoundingMode.HALF_UP);
-        BigDecimal commissionAmount = grossAmount
-                .multiply(commissionRate)
-                .setScale(2, RoundingMode.HALF_UP);
+        BigDecimal commissionAmount = grossAmount.multiply(commissionRate).setScale(2, RoundingMode.HALF_UP);
+        BigDecimal netAmount = grossAmount.subtract(commissionAmount).setScale(2, RoundingMode.HALF_UP);
 
-        BigDecimal netAmount = grossAmount
-                .subtract(commissionAmount)
-                .setScale(2, RoundingMode.HALF_UP);
+        LocalDateTime now = LocalDateTime.now();
 
         Settlement settlement = Settlement.builder()
+                .id(UUID.randomUUID())
                 .eventId(event.eventId())
                 .paymentId(event.paymentId())
                 .merchantId(event.merchantId())
@@ -63,9 +59,11 @@ public class SettlementService {
                 .orderId(event.orderId())
                 .sourceEventType(event.eventType())
                 .sourceEventOccurredAt(event.occurredAt())
+                .createdAt(now)
+                .updatedAt(now)
                 .build();
 
-        settlementRepository.save(settlement);
+        settlementWriter.insertIfAbsent(settlement);
     }
 
     @Transactional(readOnly = true)

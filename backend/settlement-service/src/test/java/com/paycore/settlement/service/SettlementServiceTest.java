@@ -7,6 +7,7 @@ import com.paycore.settlement.dto.SettlementResponse;
 import com.paycore.settlement.event.PaymentEvent;
 import com.paycore.settlement.exception.SettlementNotFoundException;
 import com.paycore.settlement.repository.SettlementRepository;
+import com.paycore.settlement.repository.SettlementWriter;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
@@ -24,7 +25,10 @@ import java.util.UUID;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
-import static org.mockito.Mockito.*;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.verifyNoInteractions;
+import static org.mockito.Mockito.when;
 
 @ExtendWith(MockitoExtension.class)
 class SettlementServiceTest {
@@ -32,38 +36,31 @@ class SettlementServiceTest {
     @Mock
     private SettlementRepository settlementRepository;
 
+    @Mock
+    private SettlementWriter settlementWriter;
+
     private SettlementService settlementService;
 
     @BeforeEach
     void setUp() {
-        settlementService = new SettlementService(settlementRepository);
-
-        ReflectionTestUtils.setField(
-                settlementService,
-                "commissionRate",
-                new BigDecimal("0.025")
-        );
+        settlementService = new SettlementService(settlementRepository, settlementWriter);
+        ReflectionTestUtils.setField(settlementService, "commissionRate", new BigDecimal("0.025"));
     }
 
     @Test
     void processPaymentEvent_shouldCreateSettlement_whenEventTypeIsPaymentAuthorized() {
-        PaymentEvent event = createPaymentEvent(
-                "PAYMENT_AUTHORIZED",
-                new BigDecimal("1000.00")
-        );
+        PaymentEvent event = createPaymentEvent("PAYMENT_AUTHORIZED", new BigDecimal("1000.00"));
 
-        when(settlementRepository.existsByEventId(event.eventId())).thenReturn(false);
-        when(settlementRepository.existsByPaymentId(event.paymentId())).thenReturn(false);
-        when(settlementRepository.save(any(Settlement.class)))
-                .thenAnswer(invocation -> invocation.getArgument(0));
+        when(settlementWriter.insertIfAbsent(any(Settlement.class))).thenReturn(true);
 
         settlementService.processPaymentEvent(event);
 
         ArgumentCaptor<Settlement> captor = ArgumentCaptor.forClass(Settlement.class);
-        verify(settlementRepository).save(captor.capture());
+        verify(settlementWriter).insertIfAbsent(captor.capture());
 
         Settlement savedSettlement = captor.getValue();
 
+        assertThat(savedSettlement.getId()).isNotNull();
         assertThat(savedSettlement.getEventId()).isEqualTo(event.eventId());
         assertThat(savedSettlement.getPaymentId()).isEqualTo(event.paymentId());
         assertThat(savedSettlement.getMerchantId()).isEqualTo(event.merchantId());
@@ -77,69 +74,41 @@ class SettlementServiceTest {
         assertThat(savedSettlement.getOrderId()).isEqualTo(event.orderId());
         assertThat(savedSettlement.getSourceEventType()).isEqualTo("PAYMENT_AUTHORIZED");
         assertThat(savedSettlement.getSourceEventOccurredAt()).isEqualTo(event.occurredAt());
+        assertThat(savedSettlement.getCreatedAt()).isNotNull();
+        assertThat(savedSettlement.getUpdatedAt()).isNotNull();
     }
 
     @Test
     void processPaymentEvent_shouldIgnoreEvent_whenEventTypeIsNotPaymentAuthorized() {
-        PaymentEvent event = createPaymentEvent(
-                "PAYMENT_FAILED",
-                new BigDecimal("1000.00")
-        );
+        PaymentEvent event = createPaymentEvent("PAYMENT_FAILED", new BigDecimal("1000.00"));
 
         settlementService.processPaymentEvent(event);
 
+        verifyNoInteractions(settlementRepository, settlementWriter);
+    }
+
+    @Test
+    void processPaymentEvent_shouldCompleteNormally_whenSettlementAlreadyExists() {
+        PaymentEvent event = createPaymentEvent("PAYMENT_AUTHORIZED", new BigDecimal("1000.00"));
+
+        when(settlementWriter.insertIfAbsent(any(Settlement.class))).thenReturn(false);
+
+        settlementService.processPaymentEvent(event);
+
+        verify(settlementWriter).insertIfAbsent(any(Settlement.class));
         verifyNoInteractions(settlementRepository);
     }
 
     @Test
-    void processPaymentEvent_shouldNotCreateSettlement_whenEventAlreadyProcessed() {
-        PaymentEvent event = createPaymentEvent(
-                "PAYMENT_AUTHORIZED",
-                new BigDecimal("1000.00")
-        );
-
-        when(settlementRepository.existsByEventId(event.eventId())).thenReturn(true);
-
-        settlementService.processPaymentEvent(event);
-
-        verify(settlementRepository).existsByEventId(event.eventId());
-        verify(settlementRepository, never()).existsByPaymentId(any(UUID.class));
-        verify(settlementRepository, never()).save(any(Settlement.class));
-    }
-
-    @Test
-    void processPaymentEvent_shouldNotCreateSettlement_whenPaymentAlreadyHasSettlement() {
-        PaymentEvent event = createPaymentEvent(
-                "PAYMENT_AUTHORIZED",
-                new BigDecimal("1000.00")
-        );
-
-        when(settlementRepository.existsByEventId(event.eventId())).thenReturn(false);
-        when(settlementRepository.existsByPaymentId(event.paymentId())).thenReturn(true);
-
-        settlementService.processPaymentEvent(event);
-
-        verify(settlementRepository).existsByEventId(event.eventId());
-        verify(settlementRepository).existsByPaymentId(event.paymentId());
-        verify(settlementRepository, never()).save(any(Settlement.class));
-    }
-
-    @Test
     void processPaymentEvent_shouldRoundGrossCommissionAndNetAmounts() {
-        PaymentEvent event = createPaymentEvent(
-                "PAYMENT_AUTHORIZED",
-                new BigDecimal("1000.126")
-        );
+        PaymentEvent event = createPaymentEvent("PAYMENT_AUTHORIZED", new BigDecimal("1000.126"));
 
-        when(settlementRepository.existsByEventId(event.eventId())).thenReturn(false);
-        when(settlementRepository.existsByPaymentId(event.paymentId())).thenReturn(false);
-        when(settlementRepository.save(any(Settlement.class)))
-                .thenAnswer(invocation -> invocation.getArgument(0));
+        when(settlementWriter.insertIfAbsent(any(Settlement.class))).thenReturn(true);
 
         settlementService.processPaymentEvent(event);
 
         ArgumentCaptor<Settlement> captor = ArgumentCaptor.forClass(Settlement.class);
-        verify(settlementRepository).save(captor.capture());
+        verify(settlementWriter).insertIfAbsent(captor.capture());
 
         Settlement savedSettlement = captor.getValue();
 
@@ -203,8 +172,7 @@ class SettlementServiceTest {
     void getMerchantSettlementSummary_shouldReturnZeroSummary_whenMerchantHasNoSettlements() {
         UUID merchantId = UUID.randomUUID();
 
-        when(settlementRepository.findByMerchantIdOrderByCreatedAtDesc(merchantId))
-                .thenReturn(List.of());
+        when(settlementRepository.findByMerchantIdOrderByCreatedAtDesc(merchantId)).thenReturn(List.of());
 
         MerchantSettlementSummaryResponse response =
                 settlementService.getMerchantSettlementSummary(merchantId);
