@@ -6,6 +6,7 @@ import com.paycore.notification.domain.NotificationType;
 import com.paycore.notification.dto.NotificationLogResponse;
 import com.paycore.notification.dto.PaymentNotificationMessage;
 import com.paycore.notification.repository.NotificationLogRepository;
+import com.paycore.notification.repository.NotificationLogWriter;
 import lombok.RequiredArgsConstructor;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
@@ -19,10 +20,13 @@ import java.util.UUID;
 public class NotificationService {
 
     private final NotificationLogRepository notificationLogRepository;
+    private final NotificationLogWriter notificationLogWriter;
 
     @Transactional
     public void processPaymentNotification(PaymentNotificationMessage message) {
         NotificationLog log = NotificationLog.builder()
+                .id(UUID.randomUUID())
+                .notificationId(message.notificationId())
                 .paymentId(message.paymentId())
                 .merchantId(message.merchantId())
                 .merchantName(message.merchantName())
@@ -40,9 +44,13 @@ public class NotificationService {
                 .receivedAt(LocalDateTime.now())
                 .build();
 
-        NotificationLog savedLog = notificationLogRepository.save(log);
+        boolean inserted = notificationLogWriter.insertIfAbsent(log);
 
-        simulateSending(savedLog);
+        if (!inserted) {
+            return;
+        }
+
+        simulateSending(log);
     }
 
     @Transactional(readOnly = true)
@@ -62,9 +70,13 @@ public class NotificationService {
     }
 
     private void simulateSending(NotificationLog log) {
-        log.setStatus(NotificationStatus.SENT);
-        log.setSentAt(LocalDateTime.now());
-        notificationLogRepository.save(log);
+        LocalDateTime sentAt = LocalDateTime.now();
+
+        boolean updated = notificationLogWriter.markSent(log.getId(), sentAt);
+
+        if (!updated) {
+            throw new IllegalStateException("Notification log could not be marked as SENT: " + log.getId());
+        }
     }
 
     private String buildNotificationMessage(PaymentNotificationMessage message) {

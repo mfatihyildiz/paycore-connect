@@ -11,6 +11,7 @@ import java.util.UUID;
 
 import static org.mockito.ArgumentMatchers.isNull;
 import static org.mockito.Mockito.*;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 class PaymentNotificationConsumerTest {
 
@@ -39,6 +40,18 @@ class PaymentNotificationConsumerTest {
 
         verify(notificationService).processPaymentNotification(isNull());
         verifyNoMoreInteractions(notificationService);
+    }
+
+    @Test
+    void consumePaymentNotification_shouldPropagateException_whenNotificationProcessingFails() {
+        PaymentNotificationMessage message = createPaymentNotificationMessage();
+        RuntimeException processingFailure = new RuntimeException("Database unavailable");
+
+        doThrow(processingFailure).when(notificationService).processPaymentNotification(message);
+
+        assertThatThrownBy(() -> paymentNotificationConsumer.consumePaymentNotification(message)).isSameAs(processingFailure);
+
+        verify(notificationService).processPaymentNotification(message);
     }
 
     private PaymentNotificationMessage createPaymentNotificationMessage() {

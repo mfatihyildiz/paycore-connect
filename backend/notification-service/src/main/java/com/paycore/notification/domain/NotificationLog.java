@@ -20,6 +20,9 @@ public class NotificationLog {
     @GeneratedValue(strategy = GenerationType.UUID)
     private UUID id;
 
+    @Column(name = "notification_id", nullable = false, unique = true)
+    private UUID notificationId;
+
     @Column(nullable = false)
     private UUID paymentId;
 

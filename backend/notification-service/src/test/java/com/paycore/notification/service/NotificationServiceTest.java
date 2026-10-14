@@ -6,9 +6,11 @@ import com.paycore.notification.domain.NotificationType;
 import com.paycore.notification.dto.NotificationLogResponse;
 import com.paycore.notification.dto.PaymentNotificationMessage;
 import com.paycore.notification.repository.NotificationLogRepository;
+import com.paycore.notification.repository.NotificationLogWriter;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
+import org.mockito.ArgumentCaptor;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
 
@@ -16,10 +18,10 @@ import java.math.BigDecimal;
 import java.time.LocalDateTime;
 import java.util.List;
 import java.util.UUID;
-import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.Mockito.*;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 @ExtendWith(MockitoExtension.class)
 class NotificationServiceTest {
@@ -27,11 +29,14 @@ class NotificationServiceTest {
     @Mock
     private NotificationLogRepository notificationLogRepository;
 
+    @Mock
+    private NotificationLogWriter notificationLogWriter;
+
     private NotificationService notificationService;
 
     @BeforeEach
     void setUp() {
-        notificationService = new NotificationService(notificationLogRepository);
+        notificationService = new NotificationService(notificationLogRepository, notificationLogWriter);
     }
 
     @Test
@@ -42,49 +47,42 @@ class NotificationServiceTest {
                 "APPROVED"
         );
 
-        AtomicInteger saveCallCounter = new AtomicInteger(0);
-
-        when(notificationLogRepository.save(any(NotificationLog.class)))
-                .thenAnswer(invocation -> {
-                    NotificationLog log = invocation.getArgument(0);
-                    int callNumber = saveCallCounter.incrementAndGet();
-
-                    if (callNumber == 1) {
-                        assertThat(log.getPaymentId()).isEqualTo(message.paymentId());
-                        assertThat(log.getMerchantId()).isEqualTo(message.merchantId());
-                        assertThat(log.getMerchantName()).isEqualTo(message.merchantName());
-                        assertThat(log.getNotificationType()).isEqualTo(NotificationType.PAYMENT_RESULT);
-                        assertThat(log.getPaymentStatus()).isEqualTo("AUTHORIZED");
-                        assertThat(log.getAmount()).isEqualByComparingTo("1000.00");
-                        assertThat(log.getCurrency()).isEqualTo("TRY");
-                        assertThat(log.getOrderId()).isEqualTo(message.orderId());
-                        assertThat(log.getProviderReferenceId()).isEqualTo(message.providerReferenceId());
-                        assertThat(log.getProviderResponseCode()).isEqualTo("00");
-                        assertThat(log.getProviderResponseMessage()).isEqualTo("APPROVED");
-                        assertThat(log.getStatus()).isEqualTo(NotificationStatus.RECEIVED);
-                        assertThat(log.getSimulatedTarget()).isEqualTo("merchant-webhook://" + message.merchantId());
-                        assertThat(log.getMessage()).contains("Payment AUTHORIZED");
-                        assertThat(log.getMessage()).contains(message.orderId());
-                        assertThat(log.getMessage()).contains("1000.00 TRY");
-                        assertThat(log.getMessage()).contains("Provider response: APPROVED");
-                        assertThat(log.getReceivedAt()).isNotNull();
-                        assertThat(log.getSentAt()).isNull();
-
-                        log.setId(UUID.randomUUID());
-                    }
-
-                    if (callNumber == 2) {
-                        assertThat(log.getStatus()).isEqualTo(NotificationStatus.SENT);
-                        assertThat(log.getSentAt()).isNotNull();
-                    }
-
-                    return log;
-                });
+        when(notificationLogWriter.insertIfAbsent(any(NotificationLog.class))).thenReturn(true);
+        when(notificationLogWriter.markSent(any(UUID.class), any(LocalDateTime.class))).thenReturn(true);
 
         notificationService.processPaymentNotification(message);
 
-        verify(notificationLogRepository, times(2)).save(any(NotificationLog.class));
-        assertThat(saveCallCounter.get()).isEqualTo(2);
+        ArgumentCaptor<NotificationLog> logCaptor = ArgumentCaptor.forClass(NotificationLog.class);
+
+        verify(notificationLogWriter).insertIfAbsent(logCaptor.capture());
+
+        NotificationLog log = logCaptor.getValue();
+
+        assertThat(log.getId()).isNotNull();
+        assertThat(log.getNotificationId()).isEqualTo(message.notificationId());
+        assertThat(log.getPaymentId()).isEqualTo(message.paymentId());
+        assertThat(log.getMerchantId()).isEqualTo(message.merchantId());
+        assertThat(log.getMerchantName()).isEqualTo(message.merchantName());
+        assertThat(log.getNotificationType()).isEqualTo(NotificationType.PAYMENT_RESULT);
+        assertThat(log.getPaymentStatus()).isEqualTo("AUTHORIZED");
+        assertThat(log.getAmount()).isEqualByComparingTo("1000.00");
+        assertThat(log.getCurrency()).isEqualTo("TRY");
+        assertThat(log.getOrderId()).isEqualTo(message.orderId());
+        assertThat(log.getProviderReferenceId()).isEqualTo(message.providerReferenceId());
+        assertThat(log.getProviderResponseCode()).isEqualTo("00");
+        assertThat(log.getProviderResponseMessage()).isEqualTo("APPROVED");
+        assertThat(log.getStatus()).isEqualTo(NotificationStatus.RECEIVED);
+        assertThat(log.getSimulatedTarget()).isEqualTo("merchant-webhook://" + message.merchantId());
+        assertThat(log.getMessage()).contains("Payment AUTHORIZED");
+        assertThat(log.getMessage()).contains(message.orderId());
+        assertThat(log.getMessage()).contains("1000.00 TRY");
+        assertThat(log.getMessage()).contains("Provider response: APPROVED");
+        assertThat(log.getReceivedAt()).isNotNull();
+        assertThat(log.getSentAt()).isNull();
+
+        verify(notificationLogWriter).markSent(eq(log.getId()), any(LocalDateTime.class));
+
+        verifyNoInteractions(notificationLogRepository);
     }
 
     @Test
@@ -95,36 +93,60 @@ class NotificationServiceTest {
                 "Payment rejected due to high fraud risk"
         );
 
-        AtomicInteger saveCallCounter = new AtomicInteger(0);
-
-        when(notificationLogRepository.save(any(NotificationLog.class)))
-                .thenAnswer(invocation -> {
-                    NotificationLog log = invocation.getArgument(0);
-                    int callNumber = saveCallCounter.incrementAndGet();
-
-                    if (callNumber == 1) {
-                        assertThat(log.getPaymentStatus()).isEqualTo("FAILED");
-                        assertThat(log.getProviderResponseCode()).isEqualTo("FRAUD_REJECTED");
-                        assertThat(log.getProviderResponseMessage()).isEqualTo("Payment rejected due to high fraud risk");
-                        assertThat(log.getStatus()).isEqualTo(NotificationStatus.RECEIVED);
-                        assertThat(log.getMessage()).contains("Payment FAILED");
-                        assertThat(log.getMessage()).contains("Provider response: Payment rejected due to high fraud risk");
-
-                        log.setId(UUID.randomUUID());
-                    }
-
-                    if (callNumber == 2) {
-                        assertThat(log.getStatus()).isEqualTo(NotificationStatus.SENT);
-                        assertThat(log.getSentAt()).isNotNull();
-                    }
-
-                    return log;
-                });
+        when(notificationLogWriter.insertIfAbsent(any(NotificationLog.class))).thenReturn(true);
+        when(notificationLogWriter.markSent(any(UUID.class), any(LocalDateTime.class))).thenReturn(true);
 
         notificationService.processPaymentNotification(message);
 
-        verify(notificationLogRepository, times(2)).save(any(NotificationLog.class));
-        assertThat(saveCallCounter.get()).isEqualTo(2);
+        ArgumentCaptor<NotificationLog> captor = ArgumentCaptor.forClass(NotificationLog.class);
+
+        verify(notificationLogWriter).insertIfAbsent(captor.capture());
+
+        NotificationLog log = captor.getValue();
+
+        assertThat(log.getNotificationId()).isEqualTo(message.notificationId());
+        assertThat(log.getPaymentStatus()).isEqualTo("FAILED");
+        assertThat(log.getProviderResponseCode()).isEqualTo("FRAUD_REJECTED");
+        assertThat(log.getProviderResponseMessage()).isEqualTo("Payment rejected due to high fraud risk");
+        assertThat(log.getStatus()).isEqualTo(NotificationStatus.RECEIVED);
+        assertThat(log.getMessage()).contains("Payment FAILED");
+        assertThat(log.getMessage()).contains("Provider response: Payment rejected due to high fraud risk");
+
+        verify(notificationLogWriter).markSent(eq(log.getId()), any(LocalDateTime.class));
+    }
+
+    @Test
+    void processPaymentNotification_shouldCompleteNormally_whenNotificationAlreadyExists() {
+        PaymentNotificationMessage message = createPaymentNotificationMessage(
+                "AUTHORIZED",
+                "00",
+                "APPROVED"
+        );
+
+        when(notificationLogWriter.insertIfAbsent(any(NotificationLog.class))).thenReturn(false);
+
+        notificationService.processPaymentNotification(message);
+
+        verify(notificationLogWriter).insertIfAbsent(any(NotificationLog.class));
+        verify(notificationLogWriter, never()).markSent(any(UUID.class), any(LocalDateTime.class));
+
+        verifyNoInteractions(notificationLogRepository);
+    }
+
+    @Test
+    void processPaymentNotification_shouldFail_whenNotificationCannotBeMarkedAsSent() {
+        PaymentNotificationMessage message = createPaymentNotificationMessage(
+                "AUTHORIZED",
+                "00",
+                "APPROVED"
+        );
+
+        when(notificationLogWriter.insertIfAbsent(any(NotificationLog.class))).thenReturn(true);
+        when(notificationLogWriter.markSent(any(UUID.class), any(LocalDateTime.class))).thenReturn(false);
+
+        assertThatThrownBy(() -> notificationService.processPaymentNotification(message))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("Notification log could not be marked as SENT");
     }
 
     @Test
@@ -267,6 +289,7 @@ class NotificationServiceTest {
                 .message("Payment " + paymentStatus + " for order ORDER-NOTIFICATION-1001 with amount 1000.00 TRY. Provider response: APPROVED")
                 .receivedAt(receivedAt)
                 .sentAt(sentAt)
+                .notificationId(UUID.randomUUID())
                 .build();
     }
 }
