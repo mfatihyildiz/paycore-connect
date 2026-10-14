@@ -39,12 +39,14 @@ public class LedgerKafkaErrorConfig {
 
     @Bean("ledgerDltKafkaTemplate")
     public KafkaTemplate<String, Object> ledgerDltKafkaTemplate(
-            @Value("${spring.kafka.bootstrap-servers}") String bootstrapServers) {
+            @Value("${spring.kafka.bootstrap-servers}") String bootstrapServers,
+            @Value("${paycore.kafka.retry.dlt-publish-timeout-seconds}") long publishTimeoutSeconds) {
 
         Map<String, Object> producerProperties = new HashMap<>();
         producerProperties.put(ProducerConfig.BOOTSTRAP_SERVERS_CONFIG, bootstrapServers);
         producerProperties.put(ProducerConfig.ACKS_CONFIG, "all");
         producerProperties.put(ProducerConfig.ENABLE_IDEMPOTENCE_CONFIG, true);
+        producerProperties.put(ProducerConfig.MAX_BLOCK_MS_CONFIG, Duration.ofSeconds(publishTimeoutSeconds).toMillis());
 
         JacksonJsonSerializer<Object> jsonSerializer = new JacksonJsonSerializer<Object>().noTypeInfo();
 
