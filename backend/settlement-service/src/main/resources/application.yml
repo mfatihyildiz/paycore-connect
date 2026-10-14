@@ -12,20 +12,22 @@ spring:
     driver-class-name: org.postgresql.Driver
 
   kafka:
-    bootstrap-servers: localhost:9092
+    bootstrap-servers: ${SPRING_KAFKA_BOOTSTRAP_SERVERS:localhost:9092}
+
     consumer:
       group-id: settlement-service-group
       auto-offset-reset: earliest
       enable-auto-commit: false
       key-deserializer: org.apache.kafka.common.serialization.StringDeserializer
-      value-deserializer: org.springframework.kafka.support.serializer.JsonDeserializer
+      value-deserializer: org.springframework.kafka.support.serializer.ErrorHandlingDeserializer
       properties:
+        spring.deserializer.value.delegate.class: org.springframework.kafka.support.serializer.JacksonJsonDeserializer
         spring.json.trusted.packages: "*"
         spring.json.use.type.headers: false
         spring.json.value.default.type: com.paycore.settlement.event.PaymentEvent
 
-      listener:
-        ack-mode: record
+    listener:
+      ack-mode: record
 
   jpa:
     hibernate:
@@ -43,6 +45,14 @@ paycore:
   kafka:
     topics:
       payment-events: payment-events
+      settlement-dlt: payment-events.settlement.DLT
+
+    retry:
+      max-retries: 3
+      initial-interval-ms: 1000
+      multiplier: 2.0
+      max-interval-ms: 4000
+      dlt-publish-timeout-seconds: 5
 
   settlement:
     commission-rate: 0.025
