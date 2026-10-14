@@ -4,7 +4,7 @@
 
 The project simulates a real world payment infrastructure where merchants can initiate payments, validate API keys, route payment requests to mock or legacy banking providers, run fraud checks, publish payment events, create ledger records, calculate settlements, and generate notification logs.
 
-The main purpose of this project is to demonstrate a production oriented backend architecture using synchronous and asynchronous communication patterns, multiple persistence technologies, API Gateway routing, event driven processing, SOAP integration, Flyway database migrations, PostgreSQL backed HTTP idempotency, transactional outbox messaging, broker outage recovery, and a React based dashboard.
+The main purpose of this project is to demonstrate a production oriented backend architecture using synchronous and asynchronous communication patterns, multiple persistence technologies, API Gateway routing, event driven processing, SOAP integration, Flyway database migrations, PostgreSQL backed HTTP idempotency, transactional outbox messaging, broker outage recovery, database-enforced idempotent consumers, bounded consumer retries, dead-letter handling, and a React based dashboard.
 
 ---
 
@@ -20,6 +20,7 @@ The main purpose of this project is to demonstrate a production oriented backend
 * [Data Storage Design](#data-storage-design)
 * [Payment Idempotency](#payment-idempotency)
 * [Transactional Outbox](#transactional-outbox)
+* [Consumer Reliability and Dead-Letter Handling](#consumer-reliability-and-dead-letter-handling)
 * [Event-Driven Architecture](#event-driven-architecture)
 * [Fraud Detection Flow](#fraud-detection-flow)
 * [SOAP Legacy Bank Integration](#soap-legacy-bank-integration)
@@ -52,8 +53,10 @@ The system allows merchants to:
 * Run fraud checks before authorization.
 * Store payment state and asynchronous broker messages atomically in PostgreSQL.
 * Publish payment domain events to Kafka through a transactional outbox relay.
-* Consume payment events for ledger and settlement processes.
+* Consume payment events idempotently for ledger and settlement processes.
 * Publish notification jobs to RabbitMQ through the same outbox mechanism.
+* Process notification jobs idempotently using stable `notificationId` values.
+* Retry transient consumer failures with bounded backoff and route terminal failures to Kafka DLTs or a RabbitMQ DLQ.
 * Recover pending broker messages automatically after Kafka or RabbitMQ outages.
 * Monitor the full flow from a React dashboard.
 
@@ -236,7 +239,10 @@ The Ledger Service consumes payment events from Kafka and stores an immutable ev
 It is responsible for:
 
 * Consuming payment lifecycle events.
-* Persisting event records.
+* Persisting each event idempotently using the event's stable `eventId`.
+* Treating duplicate deliveries as a database no-op.
+* Retrying transient processing failures with bounded exponential backoff.
+* Routing terminal Kafka failures to `payment-events.ledger.DLT`.
 * Reconstructing payment state from events.
 * Providing event history per payment or merchant.
 
@@ -256,6 +262,9 @@ This service uses:
 
 * **Kafka** as the event source.
 * **PostgreSQL** as persistent event storage.
+* **Flyway** for versioned ledger schema migrations.
+
+Ledger writes use a database unique key on `event_id` together with `INSERT ... ON CONFLICT DO NOTHING`, making duplicate Kafka deliveries race-safe even under concurrent processing.
 
 Main endpoints:
 
@@ -311,6 +320,9 @@ It is responsible for:
 
 * Listening to Kafka payment events.
 * Processing only authorized payments.
+* Enforcing idempotency for both `eventId` and `paymentId`.
+* Retrying transient processing failures with bounded exponential backoff.
+* Routing terminal Kafka failures to `payment-events.settlement.DLT`.
 * Calculating commission amounts.
 * Calculating net settlement amounts.
 * Storing settlement records.
@@ -320,6 +332,9 @@ This service uses:
 
 * **Kafka** to consume payment events.
 * **PostgreSQL** to store settlement records.
+* **Flyway** for versioned settlement schema migrations.
+
+The settlement table enforces separate unique business invariants for `event_id` and `payment_id`. The consumer performs a race-safe `INSERT ... ON CONFLICT DO NOTHING`, so duplicate authorized events or different event IDs for an already-settled payment do not create additional settlement rows.
 
 Example settlement calculation:
 
@@ -388,7 +403,10 @@ The Notification Service processes asynchronous payment notification jobs.
 It is responsible for:
 
 * Consuming RabbitMQ messages.
-* Processing payment notification requests.
+* Processing each logical notification idempotently using `notificationId`.
+* Retrying transient listener failures with bounded backoff.
+* Rejecting exhausted failures without infinite requeue.
+* Routing terminal failures through `notification.dlx` to `payment.notification.dlq`.
 * Storing notification logs.
 * Providing notification history per payment or merchant.
 
@@ -396,8 +414,9 @@ This service uses:
 
 * **RabbitMQ** as the message broker.
 * **PostgreSQL** as notification log storage.
+* **Flyway** for versioned notification schema migrations.
 
-RabbitMQ is used because notification delivery is a background task. The payment flow should not wait for notification processing to finish.
+RabbitMQ is used because notification delivery is a background task. The payment flow should not wait for notification processing to finish. The notification log table enforces a unique `notification_id`, and duplicate deliveries are handled as a database no-op before the simulated send state is finalized.
 
 Main endpoints:
 
@@ -486,8 +505,8 @@ The system is designed around the following architectural layers:
 | PostgreSQL | Relational storage for merchants, payments, outbox, ledger, settlements, logs |
 | MongoDB    | Document storage for fraud check records and risk metadata           |
 | Redis      | API key cache for fast merchant validation                           |
-| Kafka      | Event streaming for payment lifecycle events                         |
-| RabbitMQ   | Queue-based background notification processing                       |
+| Kafka      | Payment event streaming plus service-specific dead-letter topics      |
+| RabbitMQ   | Notification jobs with bounded retry, DLX, and dead-letter queue       |
 +----------------------------------------------------------------------------------+
 ```
 
@@ -600,8 +619,7 @@ When a payment request is received, Payment Service coordinates durable HTTP ide
 21. Same-payment Kafka lifecycle ordering is preserved so PAYMENT_INITIATED
     is published before the later PAYMENT_AUTHORIZED or PAYMENT_FAILED event.
 
-22. Ledger and Settlement consume Kafka events; Notification Service consumes
-    RabbitMQ notification messages.
+22. Ledger and Settlement consume Kafka events idempotently with bounded retry and service-specific DLTs; Notification Service consumes RabbitMQ jobs idempotently with bounded retry and DLQ handling.
 
 23. React Dashboard fetches payment, ledger, settlement, fraud, and
     notification outputs through API Gateway.
@@ -618,9 +636,9 @@ When a payment request is received, Payment Service coordinates durable HTTP ide
 | Payment Service          | Payment orchestration and transactional outbox relay | PostgreSQL, Kafka, RabbitMQ | REST, SOAP, asynchronous Kafka/RabbitMQ publication |
 | Fraud Service            | Risk scoring and fraud check persistence         | MongoDB                     | REST                                          |
 | Legacy Bank SOAP Service | Simulated legacy bank authorization              | None                        | SOAP                                          |
-| Ledger Service           | Immutable event history and state reconstruction | PostgreSQL, Kafka           | Kafka consumer, REST                          |
-| Settlement Service       | Merchant payout calculation                      | PostgreSQL, Kafka           | Kafka consumer, REST                          |
-| Notification Service     | Notification job processing and log persistence  | PostgreSQL, RabbitMQ        | RabbitMQ consumer, REST                       |
+| Ledger Service           | Immutable event history, idempotent consumption, state reconstruction | PostgreSQL, Kafka | Kafka consumer, DLT, REST |
+| Settlement Service       | Idempotent merchant payout calculation           | PostgreSQL, Kafka           | Kafka consumer, DLT, REST |
+| Notification Service     | Idempotent notification processing and log persistence | PostgreSQL, RabbitMQ | RabbitMQ consumer, DLX/DLQ, REST |
 
 ---
 
@@ -646,9 +664,9 @@ The main payment flow works as follows:
 16. The HTTP request completes without waiting for broker publication.
 17. The outbox publisher asynchronously claims eligible rows and publishes their stored payloads to Kafka or RabbitMQ.
 18. Successful broker acknowledgments move rows to `PUBLISHED`; failures are retried with durable metadata and exponential backoff.
-19. Ledger Service consumes Kafka events and stores immutable payment event history.
-20. Settlement Service consumes authorized payment events and calculates merchant settlement.
-21. Notification Service consumes RabbitMQ messages and stores notification logs.
+19. Ledger Service consumes Kafka events idempotently and stores immutable payment event history; exhausted processing failures are routed to its service-specific DLT.
+20. Settlement Service consumes authorized payment events idempotently, enforces one settlement per payment, and routes exhausted processing failures to its service-specific DLT.
+21. Notification Service consumes RabbitMQ messages idempotently, retries transient failures, and dead-letters exhausted failures to its DLQ.
 22. The React dashboard displays all related outputs.
 
 ---
@@ -729,6 +747,8 @@ Kafka payment-events topic -> Settlement Service
 
 The outbox publisher uses the payment ID as the Kafka message key and sends the exact serialized event payload stored at outbox creation time. It waits for the Kafka send result before marking the row `PUBLISHED`.
 
+Ledger and Settlement use independent Kafka consumer groups. Their listeners use bounded exponential retries for processing failures and service-specific dead-letter topics for terminal failures. Malformed records are handled by the deserialization error path and can be sent to the appropriate DLT while preserving the original raw payload. DLT publishing uses a bounded producer wait, including `max.block.ms`, so the recovery path does not block indefinitely.
+
 Kafka is suitable because ledger and settlement operations should react to payment events without tightly coupling themselves to Payment Service.
 
 ---
@@ -745,6 +765,8 @@ RabbitMQ notification queue -> Notification Service
 ```
 
 The publisher sends persistent JSON messages, uses the outbox event ID as correlation data, requires a positive publisher confirm, and treats mandatory returned messages as publication failures.
+
+Notification consumption uses bounded listener retry. Exhausted failures are rejected without requeue and are routed by RabbitMQ from the main queue through `notification.dlx` to `payment.notification.dlq`. Fatal conversion failures such as malformed JSON are dead-lettered instead of entering an infinite requeue loop.
 
 RabbitMQ is suitable for notification delivery because it is a task oriented asynchronous workload.
 
@@ -777,7 +799,9 @@ Why PostgreSQL?
 * Supports atomic idempotency acquisition with `INSERT ... ON CONFLICT DO NOTHING`.
 * Provides database-level uniqueness for `(merchant_id, order_id)` as a final duplicate-order backstop.
 
-The Payment Service schema is versioned with Flyway. Current payment migrations establish:
+Payment, Ledger, Settlement, and Notification schemas are versioned with Flyway.
+
+Current Payment Service migrations establish:
 
 * The `payments` table.
 * A unique `(merchant_id, order_id)` constraint and merchant/date lookup index.
@@ -787,7 +811,13 @@ The Payment Service schema is versioned with Flyway. Current payment migrations 
 * Claim/lease fields (`processing_started_at`, `lock_owner`) for concurrent-safe publication and stale claim recovery.
 * Retry metadata (`attempt_count`, `last_attempt_at`, `next_attempt_at`, `last_error`) for controlled exponential backoff.
 
-Hibernate schema management is configured for validation rather than runtime schema mutation.
+Consumer-facing schemas add database-enforced duplicate protection:
+
+* Ledger: unique `event_id`.
+* Settlement: unique `event_id` and unique `payment_id`.
+* Notification: unique `notification_id`.
+
+Ledger, Settlement, Notification, and Payment use Hibernate schema validation rather than runtime schema mutation. Merchant Service is the remaining relational service planned for migration from Hibernate-managed schema updates to Flyway.
 
 ---
 
@@ -953,7 +983,83 @@ Manual Docker E2E tests verified both failure domains:
 
 The outbox provides **at-least-once** publication semantics.
 
-A broker may accept a message and the application may fail before PostgreSQL records the row as `PUBLISHED`. That message can therefore be delivered again on retry. Consumer-side idempotency is the next reliability layer and remains a separate development phase.
+A broker may accept a message and the application may fail before PostgreSQL records the row as `PUBLISHED`. That message can therefore be delivered again on retry. The downstream consumers are therefore designed for **at-least-once delivery with idempotent business effects** rather than exactly-once delivery. Ledger, Settlement, and Notification all enforce duplicate protection at the database boundary.
+
+---
+
+## Consumer Reliability and Dead-Letter Handling
+
+At-least-once broker delivery means duplicate messages and retryable failures are expected operating conditions. Consumer correctness is therefore enforced at the database boundary, while broker-specific recovery mechanisms prevent poison or permanently failing messages from blocking normal processing.
+
+### Database-Enforced Idempotency
+
+The three asynchronous consumers use stable message identifiers and race-safe database writes:
+
+| Consumer | Idempotency Boundary | Duplicate Behavior |
+|---|---|---|
+| Ledger Service | Unique `event_id` | `INSERT ... ON CONFLICT DO NOTHING` |
+| Settlement Service | Unique `event_id` and unique `payment_id` | Duplicate event or already-settled payment becomes a no-op |
+| Notification Service | Unique `notification_id` | Duplicate delivery becomes a no-op |
+
+This design does not claim exactly-once delivery. Brokers may redeliver; the services guarantee that repeated delivery does not create repeated business rows.
+
+### Kafka Retry and DLT
+
+Ledger and Settlement use independent Kafka consumer groups with record-level acknowledgment and exception propagation.
+
+Processing failures use bounded exponential retry. If processing still fails after the configured retry budget, the original record is published to a service-specific dead-letter topic:
+
+```text
+payment-events
+   |
+   +--> Ledger Service
+   |      |
+   |      +--> payment-events.ledger.DLT
+   |
+   +--> Settlement Service
+          |
+          +--> payment-events.settlement.DLT
+```
+
+Malformed JSON is handled by the Kafka deserialization error path and can be routed directly to the corresponding DLT without repeatedly invoking the business listener. The DLT publisher can serialize both normal `PaymentEvent` objects and raw `byte[]` payloads so poison messages can be preserved for investigation.
+
+DLT publication is also bounded: the recovery producer uses the configured publish timeout for both result waiting and Kafka `max.block.ms`.
+
+### RabbitMQ Retry and DLQ
+
+Notification Service uses bounded listener retry with requeue disabled after recovery is exhausted.
+
+```text
+notification.exchange
+        |
+        v
+payment.notification.queue
+        |
+        | transient failure -> bounded retry
+        |
+        | exhausted / fatal failure
+        v
+notification.dlx
+        |
+        v
+payment.notification.dlq
+```
+
+This prevents an unprocessable notification from cycling forever in the main queue. Fatal message conversion failures can be dead-lettered directly, while transient processing failures can succeed on a later retry if the dependency recovers.
+
+### Verified Failure Scenarios
+
+Manual broker-level E2E validation has covered:
+
+* Malformed Kafka records routed to the appropriate DLT.
+* Permanent Ledger and Settlement database failures retried and then dead-lettered.
+* Transient Settlement failures recovered successfully during retry without DLT publication.
+* Malformed RabbitMQ notification JSON routed to the DLQ.
+* Permanent Notification database failures retried and then dead-lettered.
+* Transient Notification database failures recovered successfully during retry without DLQ publication.
+* Repeated Ledger, Settlement, and Notification deliveries producing only one database business effect.
+
+These scenarios complement the database concurrency integration tests used to validate duplicate handling.
 
 ---
 
@@ -973,7 +1079,9 @@ The event JSON is serialized once during outbox creation. A scheduled publisher 
 
 ### Ledger Service Event Consumption
 
-Ledger Service consumes all payment events and stores them as immutable records.
+Ledger Service consumes all payment events and stores them as immutable records. A unique `event_id` together with `INSERT ... ON CONFLICT DO NOTHING` makes duplicate delivery a race-safe no-op.
+
+Transient listener failures use bounded retry; exhausted failures are routed to `payment-events.ledger.DLT`.
 
 This allows the system to reconstruct a payment's final state by reading its event history.
 
@@ -1002,7 +1110,7 @@ For authorized payments, it calculates:
 
 Failed payments do not generate settlement records.
 
-Because outbox delivery is at-least-once, consumer duplicate protection is treated as a separate reliability concern and is listed in Future Improvements.
+Settlement enforces unique `event_id` and unique `payment_id` constraints. This protects both duplicate delivery of the same event and different authorized event IDs referring to a payment that has already been settled. Transient processing failures use bounded retry; exhausted failures are routed to `payment-events.settlement.DLT`.
 
 ---
 
@@ -1508,6 +1616,17 @@ OUTBOX_RETRY_MAX_DELAY_SECONDS=60
 
 These values control batch claiming, scheduler cadence, stale lease recovery, broker wait time, and exponential retry backoff.
 
+Consumer recovery uses service-specific dead-letter destinations:
+
+```text
+Ledger Kafka DLT:        payment-events.ledger.DLT
+Settlement Kafka DLT:    payment-events.settlement.DLT
+Notification Rabbit DLX: notification.dlx
+Notification Rabbit DLQ: payment.notification.dlq
+```
+
+Ledger and Settlement use record-level Kafka acknowledgment with auto-commit disabled. Notification uses RabbitMQ automatic acknowledgment together with bounded listener retry and `default-requeue-rejected: false`.
+
 ---
 
 ## Design Decisions
@@ -1538,7 +1657,7 @@ Payment persistence and broker publication cannot be made atomic with a normal l
 
 The transactional outbox stores the logical Kafka/RabbitMQ message in PostgreSQL together with the payment state change. A separate publisher then performs broker I/O, allowing payment correctness to remain independent from temporary Kafka or RabbitMQ outages.
 
-The relay uses short claim transactions, stale lease recovery, broker acknowledgments, stable stored payloads, and exponential retry backoff. Its delivery model is deliberately at-least-once, so downstream consumer idempotency remains important.
+The relay uses short claim transactions, stale lease recovery, broker acknowledgments, stable stored payloads, and exponential retry backoff. Its delivery model is deliberately at-least-once, so downstream consumer idempotency is enforced at the database boundary in Ledger, Settlement, and Notification.
 
 ---
 
@@ -1556,13 +1675,13 @@ Redis is used for fast API key validation. API key checks happen frequently in t
 
 ### Why use Kafka?
 
-Kafka is used for domain events. Ledger and settlement processes should react to payment events without being tightly coupled to Payment Service. Kafka enables durable, asynchronous, event driven processing.
+Kafka is used for domain events. Ledger and settlement processes should react to payment events without being tightly coupled to Payment Service. Kafka enables durable, asynchronous, event driven processing. Each consumer group applies database-enforced idempotency, bounded retry, and a service-specific DLT for terminal failures.
 
 ---
 
 ### Why use RabbitMQ?
 
-RabbitMQ is used for notification jobs. Notifications are background tasks and should not block the payment authorization response. RabbitMQ is a good fit for queue based task processing.
+RabbitMQ is used for notification jobs. Notifications are background tasks and should not block the payment authorization response. Notification Service combines database-enforced idempotency with bounded listener retry and a DLX/DLQ path for terminal failures, avoiding infinite requeue loops.
 
 ---
 
@@ -1584,7 +1703,12 @@ The project currently supports:
 * PostgreSQL-backed semantic request fingerprinting and completed-response replay.
 * Concurrent same-key request protection.
 * Database-level duplicate order protection.
-* Flyway-managed Payment Service schema migrations.
+* Flyway-managed Payment, Ledger, Settlement, and Notification schema migrations.
+* Database-enforced idempotent Ledger consumption using unique `event_id`.
+* Database-enforced idempotent Settlement consumption using unique `event_id` and `payment_id`.
+* Database-enforced idempotent Notification consumption using unique `notification_id`.
+* Race-safe `INSERT ... ON CONFLICT DO NOTHING` duplicate handling.
+* PostgreSQL concurrency integration tests for consumer duplicate protection.
 * Mock bank authorization.
 * Legacy SOAP bank authorization.
 * Fraud scoring.
@@ -1599,11 +1723,13 @@ The project currently supports:
 * Durable retry metadata and exponential backoff.
 * Kafka outage recovery without losing payment events.
 * RabbitMQ outage recovery without coupling broker availability to payment success.
-* Kafka event consumption.
+* Kafka event consumption with bounded retry and service-specific DLTs.
+* Malformed Kafka record recovery while preserving raw payloads.
+* Bounded Kafka DLT producer blocking.
 * Immutable event ledger with payment state reconstruction.
-* Settlement calculation.
-* RabbitMQ notification processing.
-* Notification log storage.
+* Settlement calculation with one-settlement-per-payment enforcement.
+* RabbitMQ notification processing with bounded retry, DLX, and DLQ.
+* Notification log storage with duplicate-delivery protection.
 * React dashboard monitoring.
 * Full Docker Compose orchestration.
 
@@ -1613,24 +1739,24 @@ The project currently supports:
 
 Potential future improvements:
 
-* Add database-enforced idempotent consumers and stronger duplicate protection for ledger, settlement, and notification processing.
-* Add concurrency tests for duplicate consumer deliveries against real databases.
-* Add dead letter handling for terminal or non-retriable messaging failures.
-* Add Resilience4j timeouts, retries, and circuit breakers around synchronous integrations.
-* Add Testcontainers-based PostgreSQL, Kafka, RabbitMQ, Redis, and MongoDB integration tests.
-* Automate Kafka/RabbitMQ outage and recovery scenarios in CI.
-* Add automated concurrency tests for payment idempotency.
+* Migrate Merchant Service schema management from Hibernate `ddl-auto: update` to Flyway and `ddl-auto: validate`.
+* Make Merchant registration concurrency-safe by treating database uniqueness as the final authority and translating duplicate constraint failures into domain conflicts.
+* Harden Redis API-key caching so PostgreSQL remains the source of truth when Redis is unavailable, malformed, or stale.
+* Add explicit connect and response timeouts around synchronous REST and SOAP integrations.
+* Make Fraud Service idempotent per payment before introducing retries around the fraud POST operation.
+* Add provider-side idempotency and reconciliation for uncertain external authorization outcomes.
+* Add Resilience4j retries and circuit breakers only where the operation is safe to retry.
+* Introduce a root Maven aggregator and a GitHub Actions CI pipeline.
+* Expand Testcontainers coverage to Kafka, RabbitMQ, Redis, and MongoDB where useful.
+* Convert manual broker outage, retry, DLT/DLQ, and recovery scenarios into repeatable CI integration tests.
 * Add contract testing between services.
 * Add distributed tracing with OpenTelemetry.
-* Add centralized logging with ELK or Loki.
+* Add structured centralized logging with ELK or Loki.
 * Add Prometheus and Grafana monitoring.
-* Add k6 load and performance tests.
+* Add k6 load, concurrency, and failure testing.
 * Add centralized authentication with JWT and role based access control.
 * Add rate limiting and broader security controls at API Gateway.
-* Add Jenkins or GitHub Actions CI/CD pipeline.
-* Add Kubernetes deployment manifests.
-* Add real payment provider adapter interfaces and provider-side idempotency support.
-* Add reconciliation for uncertain external provider outcomes.
+* Add Kubernetes deployment manifests, readiness/liveness probes, resource limits, and externalized secrets.
 * Add admin dashboard features and merchant specific reporting.
 * Add API documentation with OpenAPI aggregation.
 
@@ -1653,6 +1779,10 @@ The project includes:
 * Kafka and RabbitMQ broker acknowledgment handling.
 * Exponential broker retry backoff with persisted attempt metadata.
 * Broker outage recovery with at-least-once publication semantics.
+* Database-enforced idempotent consumer effects for Ledger, Settlement, and Notification.
+* Bounded Kafka consumer retry with service-specific DLTs.
+* Bounded RabbitMQ listener retry with DLX/DLQ handling.
+* Verified poison-message, permanent-failure, transient-recovery, and duplicate-delivery scenarios.
 * MongoDB document persistence.
 * Redis caching.
 * Kafka based event driven processing.
