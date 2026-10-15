@@ -17,6 +17,8 @@ import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.data.redis.core.ValueOperations;
+import org.springframework.dao.DataIntegrityViolationException;
+import org.springframework.data.redis.RedisConnectionFailureException;
 
 import java.time.Duration;
 import java.time.LocalDateTime;
@@ -59,7 +61,7 @@ class MerchantServiceTest {
 
         when(merchantRepository.existsByEmail(request.email())).thenReturn(false);
         when(merchantRepository.existsByApiKey(anyString())).thenReturn(false);
-        when(merchantRepository.save(any(Merchant.class)))
+        when(merchantRepository.saveAndFlush(any(Merchant.class)))
                 .thenAnswer(invocation -> {
                     Merchant merchant = invocation.getArgument(0);
                     merchant.setId(UUID.randomUUID());
@@ -84,7 +86,7 @@ class MerchantServiceTest {
 
         verify(merchantRepository).existsByEmail(request.email());
         verify(merchantRepository).existsByApiKey(anyString());
-        verify(merchantRepository).save(any(Merchant.class));
+        verify(merchantRepository).saveAndFlush(any(Merchant.class));
 
         verify(valueOperations).set(
                 eq("merchant:api-key:" + response.apiKey()),
@@ -119,7 +121,7 @@ class MerchantServiceTest {
                 .hasMessageContaining(request.email());
 
         verify(merchantRepository).existsByEmail(request.email());
-        verify(merchantRepository, never()).save(any(Merchant.class));
+        verify(merchantRepository, never()).saveAndFlush(any(Merchant.class));
         verify(merchantRepository, never()).existsByApiKey(anyString());
         verify(valueOperations, never()).set(anyString(), anyString(), any(Duration.class));
     }
@@ -358,43 +360,48 @@ class MerchantServiceTest {
     }
 
     @Test
-    void validateApiKey_shouldReturnValidResponseFromRedis_whenCacheHitOccurs() {
+    void validateApiKey_shouldConfirmCachedApiKeyAgainstDatabase() {
         UUID merchantId = UUID.randomUUID();
+
         String apiKey = "pk_live_cached_key";
         String cacheKey = "merchant:api-key:" + apiKey;
         String cachedValue = merchantId + "|Cached Merchant|ACTIVE";
 
+        Merchant merchant = createMerchant(merchantId, "Cached Merchant", "cached@example.com", apiKey, MerchantStatus.ACTIVE);
+
         when(valueOperations.get(cacheKey)).thenReturn(cachedValue);
+        when(merchantRepository.findByApiKey(apiKey)).thenReturn(Optional.of(merchant));
 
         ApiKeyValidationResponse response = merchantService.validateApiKey(apiKey);
 
-        assertThat(response).isNotNull();
         assertThat(response.valid()).isTrue();
         assertThat(response.merchantId()).isEqualTo(merchantId);
         assertThat(response.merchantName()).isEqualTo("Cached Merchant");
         assertThat(response.status()).isEqualTo(MerchantStatus.ACTIVE);
 
         verify(valueOperations).get(cacheKey);
-        verify(merchantRepository, never()).findByApiKey(anyString());
+        verify(merchantRepository).findByApiKey(apiKey);
     }
 
     @Test
-    void validateApiKey_shouldReturnInvalidResponse_whenCachedValueIsMalformed() {
+    void validateApiKey_shouldFallbackToDatabase_whenCachedValueIsMalformed() {
+        UUID merchantId = UUID.randomUUID();
+
         String apiKey = "pk_live_malformed_cache_key";
         String cacheKey = "merchant:api-key:" + apiKey;
 
+        Merchant merchant = createMerchant(merchantId, "Database Merchant", "db@example.com", apiKey, MerchantStatus.ACTIVE);
         when(valueOperations.get(cacheKey)).thenReturn("malformed-cache-value");
 
+        when(merchantRepository.findByApiKey(apiKey)).thenReturn(Optional.of(merchant));
         ApiKeyValidationResponse response = merchantService.validateApiKey(apiKey);
 
-        assertThat(response).isNotNull();
-        assertThat(response.valid()).isFalse();
-        assertThat(response.merchantId()).isNull();
-        assertThat(response.merchantName()).isNull();
-        assertThat(response.status()).isNull();
+        assertThat(response.valid()).isTrue();
+        assertThat(response.merchantId()).isEqualTo(merchantId);
+        assertThat(response.merchantName()).isEqualTo("Database Merchant");
 
-        verify(valueOperations).get(cacheKey);
-        verify(merchantRepository, never()).findByApiKey(anyString());
+        verify(stringRedisTemplate).delete(cacheKey);
+        verify(merchantRepository).findByApiKey(apiKey);
     }
 
     @Test
@@ -511,6 +518,143 @@ class MerchantServiceTest {
         verify(valueOperations).get(cacheKey);
         verify(merchantRepository).findByApiKey(apiKey);
         verify(valueOperations, never()).set(anyString(), anyString(), any(Duration.class));
+    }
+
+    @Test
+    void createMerchant_shouldTranslateEmailUniqueConstraintViolation() {
+        CreateMerchantRequest request = new CreateMerchantRequest("Concurrent Merchant", "concurrent@example.com");
+
+        when(merchantRepository.existsByEmail(request.email())).thenReturn(false);
+        when(merchantRepository.existsByApiKey(anyString())).thenReturn(false);
+
+        DataIntegrityViolationException exception =
+                new DataIntegrityViolationException("duplicate key value violates unique constraint \"uk_merchants_email\"");
+
+        when(merchantRepository.saveAndFlush(any(Merchant.class))).thenThrow(exception);
+
+        assertThatThrownBy(() -> merchantService.createMerchant(request))
+                .isInstanceOf(DuplicateMerchantEmailException.class)
+                .hasMessageContaining(request.email());
+
+        verify(merchantRepository).existsByEmail(request.email());
+        verify(merchantRepository).saveAndFlush(any(Merchant.class));
+    }
+
+    @Test
+    void createMerchant_shouldPropagateUnrelatedIntegrityViolation() {
+        CreateMerchantRequest request = new CreateMerchantRequest("Concurrent Merchant", "concurrent@example.com");
+
+        when(merchantRepository.existsByEmail(request.email())).thenReturn(false);
+        when(merchantRepository.existsByApiKey(anyString())).thenReturn(false);
+
+        DataIntegrityViolationException exception =
+                new DataIntegrityViolationException("duplicate key value violates unique constraint \"uk_merchants_api_key\"");
+
+        when(merchantRepository.saveAndFlush(any(Merchant.class))).thenThrow(exception);
+
+        assertThatThrownBy(() -> merchantService.createMerchant(request)).isSameAs(exception);
+
+        verify(merchantRepository).saveAndFlush(any(Merchant.class));
+    }
+
+    @Test
+    void validateApiKey_shouldFallbackToDatabase_whenRedisReadFails() {
+        UUID merchantId = UUID.randomUUID();
+
+        String apiKey = "pk_live_redis_down_key";
+        String cacheKey = "merchant:api-key:" + apiKey;
+
+        Merchant merchant = createMerchant(merchantId, "Redis Fallback Merchant", "redis-fallback@example.com", apiKey, MerchantStatus.ACTIVE);
+
+        when(valueOperations.get(cacheKey)).thenThrow(new RedisConnectionFailureException("Redis unavailable"));
+        when(merchantRepository.findByApiKey(apiKey)).thenReturn(Optional.of(merchant));
+        ApiKeyValidationResponse response = merchantService.validateApiKey(apiKey);
+
+        assertThat(response.valid()).isTrue();
+        assertThat(response.merchantId()).isEqualTo(merchantId);
+        assertThat(response.merchantName()).isEqualTo("Redis Fallback Merchant");
+
+        verify(merchantRepository).findByApiKey(apiKey);
+    }
+
+    @Test
+    void createMerchant_shouldSucceed_whenRedisCacheWriteFails() {
+        CreateMerchantRequest request = new CreateMerchantRequest("Redis Failure Merchant", "redis-write-failure@example.com");
+
+        when(merchantRepository.existsByEmail(request.email())).thenReturn(false);
+        when(merchantRepository.existsByApiKey(anyString())).thenReturn(false);
+        when(merchantRepository.saveAndFlush(any(Merchant.class))).thenAnswer(invocation -> {
+            Merchant merchant = invocation.getArgument(0);
+
+            merchant.setId(UUID.randomUUID());
+
+            LocalDateTime now = LocalDateTime.now();
+            merchant.setCreatedAt(now);
+            merchant.setUpdatedAt(now);
+
+            return merchant;
+        });
+
+        doThrow(new RedisConnectionFailureException("Redis unavailable"))
+                .when(valueOperations)
+                .set(anyString(), anyString(), any(Duration.class));
+
+        MerchantResponse response = merchantService.createMerchant(request);
+
+        assertThat(response).isNotNull();
+        assertThat(response.id()).isNotNull();
+        assertThat(response.email()).isEqualTo("redis-write-failure@example.com");
+        assertThat(response.status()).isEqualTo(MerchantStatus.ACTIVE);
+
+        verify(merchantRepository).saveAndFlush(any(Merchant.class));
+    }
+
+    @Test
+    void validateApiKey_shouldRejectStaleActiveCache_whenMerchantIsSuspendedInDatabase() {
+        UUID merchantId = UUID.randomUUID();
+
+        String apiKey = "pk_live_suspended_stale_key";
+        String cacheKey = "merchant:api-key:" + apiKey;
+
+        String staleCachedValue = merchantId + "|Suspended Merchant|ACTIVE";
+
+        Merchant merchant = createMerchant(merchantId, "Suspended Merchant", "suspended-stale@example.com", apiKey, MerchantStatus.SUSPENDED);
+
+        when(valueOperations.get(cacheKey)).thenReturn(staleCachedValue);
+        when(merchantRepository.findByApiKey(apiKey)).thenReturn(Optional.of(merchant));
+
+        ApiKeyValidationResponse response = merchantService.validateApiKey(apiKey);
+
+        assertThat(response.valid()).isFalse();
+        assertThat(response.merchantId()).isNull();
+        assertThat(response.merchantName()).isNull();
+        assertThat(response.status()).isNull();
+
+        verify(merchantRepository).findByApiKey(apiKey);
+        verify(stringRedisTemplate).delete(cacheKey);
+    }
+
+    @Test
+    void validateApiKey_shouldRejectStaleCache_whenApiKeyNoLongerExistsInDatabase() {
+        UUID merchantId = UUID.randomUUID();
+
+        String oldApiKey = "pk_live_rotated_old_key";
+        String cacheKey = "merchant:api-key:" + oldApiKey;
+
+        String staleCachedValue = merchantId + "|Rotated Merchant|ACTIVE";
+
+        when(valueOperations.get(cacheKey)).thenReturn(staleCachedValue);
+        when(merchantRepository.findByApiKey(oldApiKey)).thenReturn(Optional.empty());
+
+        ApiKeyValidationResponse response = merchantService.validateApiKey(oldApiKey);
+
+        assertThat(response.valid()).isFalse();
+        assertThat(response.merchantId()).isNull();
+        assertThat(response.merchantName()).isNull();
+        assertThat(response.status()).isNull();
+
+        verify(merchantRepository).findByApiKey(oldApiKey);
+        verify(stringRedisTemplate).delete(cacheKey);
     }
 
     private Merchant createMerchant(

@@ -11,16 +11,23 @@ import com.paycore.merchant.exception.DuplicateMerchantEmailException;
 import com.paycore.merchant.exception.MerchantNotFoundException;
 import com.paycore.merchant.repository.MerchantRepository;
 import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.dao.DataAccessException;
+import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
+import org.springframework.transaction.support.TransactionSynchronization;
+import org.springframework.transaction.support.TransactionSynchronizationManager;
 
 import java.security.SecureRandom;
 import java.time.Duration;
 import java.util.Base64;
 import java.util.List;
+import java.util.Optional;
 import java.util.UUID;
 
+@Slf4j
 @Service
 @RequiredArgsConstructor
 public class MerchantService {
@@ -46,8 +53,18 @@ public class MerchantService {
                 .status(MerchantStatus.ACTIVE)
                 .build();
 
-        Merchant savedMerchant = merchantRepository.save(merchant);
-        cacheActiveMerchantApiKey(savedMerchant);
+        Merchant savedMerchant;
+
+        try {
+            savedMerchant = merchantRepository.saveAndFlush(merchant);
+        } catch (DataIntegrityViolationException ex) {
+            if (isEmailUniqueViolation(ex)) {
+                throw new DuplicateMerchantEmailException(request.email());
+            }
+            throw ex;
+        }
+
+        runAfterCommit(() -> cacheActiveMerchantApiKey(savedMerchant));
 
         return toResponse(savedMerchant);
     }
@@ -73,8 +90,7 @@ public class MerchantService {
 
         Merchant updatedMerchant = merchantRepository.save(merchant);
 
-        evictApiKeyCache(updatedMerchant.getApiKey());
-        cacheActiveMerchantApiKey(updatedMerchant);
+        runAfterCommit(() -> {evictApiKeyCache(updatedMerchant.getApiKey());cacheActiveMerchantApiKey(updatedMerchant);});
 
         return toResponse(updatedMerchant);
     }
@@ -89,8 +105,7 @@ public class MerchantService {
         merchant.setApiKey(newApiKey);
         Merchant updatedMerchant = merchantRepository.save(merchant);
 
-        evictApiKeyCache(oldApiKey);
-        cacheActiveMerchantApiKey(updatedMerchant);
+        runAfterCommit(() -> {evictApiKeyCache(oldApiKey);cacheActiveMerchantApiKey(updatedMerchant);});
 
         return new GenerateApiKeyResponse(updatedMerchant.getId(), newApiKey);
     }
@@ -102,25 +117,33 @@ public class MerchantService {
         }
 
         String cacheKey = buildApiKeyCacheKey(apiKey);
-        String cachedValue = stringRedisTemplate.opsForValue().get(cacheKey);
+        String cachedValue = getCachedValue(cacheKey);
 
         if (cachedValue != null) {
-            return parseCachedApiKeyValidation(cachedValue);
+            Optional<ApiKeyValidationResponse> cachedResponse = parseCachedApiKeyValidation(cachedValue);
+
+            if (cachedResponse.isEmpty()) {
+                evictApiKeyCache(apiKey);
+            }
         }
 
-        return merchantRepository.findByApiKey(apiKey)
-                .filter(merchant -> merchant.getStatus() == MerchantStatus.ACTIVE)
-                .map(merchant -> {
-                    cacheActiveMerchantApiKey(merchant);
+        Optional<Merchant> merchantOptional = merchantRepository.findByApiKey(apiKey);
 
-                    return new ApiKeyValidationResponse(
-                            true,
-                            merchant.getId(),
-                            merchant.getName(),
-                            merchant.getStatus()
-                    );
-                })
-                .orElseGet(this::invalidApiKeyResponse);
+        if (merchantOptional.isEmpty()) {
+            evictApiKeyCache(apiKey);
+            return invalidApiKeyResponse();
+        }
+
+        Merchant merchant = merchantOptional.get();
+
+        if (merchant.getStatus() != MerchantStatus.ACTIVE) {
+            evictApiKeyCache(apiKey);
+            return invalidApiKeyResponse();
+        }
+
+        cacheActiveMerchantApiKey(merchant);
+
+        return new ApiKeyValidationResponse(true, merchant.getId(), merchant.getName(), merchant.getStatus());
     }
 
     private Merchant findMerchantOrThrow(UUID merchantId) {
@@ -140,6 +163,15 @@ public class MerchantService {
         return apiKey;
     }
 
+    private String getCachedValue(String cacheKey) {
+        try {
+            return stringRedisTemplate.opsForValue().get(cacheKey);
+        } catch (DataAccessException ex) {
+            log.warn("Merchant API key cache read failed. Falling back to PostgreSQL.");
+            return null;
+        }
+    }
+
     private void cacheActiveMerchantApiKey(Merchant merchant) {
         if (merchant.getStatus() != MerchantStatus.ACTIVE) {
             return;
@@ -151,7 +183,11 @@ public class MerchantService {
                 + "|" + merchant.getName()
                 + "|" + merchant.getStatus();
 
-        stringRedisTemplate.opsForValue().set(cacheKey, cacheValue, API_KEY_CACHE_TTL);
+        try {
+            stringRedisTemplate.opsForValue().set(cacheKey, cacheValue, API_KEY_CACHE_TTL);
+        } catch (DataAccessException ex) {
+            log.warn("Merchant API key cache write failed. PostgreSQL remains authoritative.");
+        }
     }
 
     private void evictApiKeyCache(String apiKey) {
@@ -159,26 +195,39 @@ public class MerchantService {
             return;
         }
 
-        stringRedisTemplate.delete(buildApiKeyCacheKey(apiKey));
+        try {
+            stringRedisTemplate.delete(buildApiKeyCacheKey(apiKey));
+        } catch (DataAccessException ex) {
+            log.warn("Merchant API key cache eviction failed. PostgreSQL remains authoritative.");
+        }
     }
 
     private String buildApiKeyCacheKey(String apiKey) {
         return API_KEY_CACHE_PREFIX + apiKey;
     }
 
-    private ApiKeyValidationResponse parseCachedApiKeyValidation(String cachedValue) {
-        String[] parts = cachedValue.split("\\|");
+    private Optional<ApiKeyValidationResponse> parseCachedApiKeyValidation(
+            String cachedValue
+    ) {
+        try {
+            String[] parts = cachedValue.split("\\|", -1);
 
-        if (parts.length != 3) {
-            return invalidApiKeyResponse();
+            if (parts.length != 3) {
+                return Optional.empty();
+            }
+
+            UUID merchantId = UUID.fromString(parts[0]);
+            String merchantName = parts[1];
+            MerchantStatus status = MerchantStatus.valueOf(parts[2]);
+
+            if (merchantName.isBlank() || status != MerchantStatus.ACTIVE) {
+                return Optional.empty();
+            }
+
+            return Optional.of(new ApiKeyValidationResponse(true, merchantId, merchantName, status));
+        } catch (IllegalArgumentException ex) {
+            return Optional.empty();
         }
-
-        return new ApiKeyValidationResponse(
-                true,
-                UUID.fromString(parts[0]),
-                parts[1],
-                MerchantStatus.valueOf(parts[2])
-        );
     }
 
     private ApiKeyValidationResponse invalidApiKeyResponse() {
@@ -200,5 +249,34 @@ public class MerchantService {
                 merchant.getCreatedAt(),
                 merchant.getUpdatedAt()
         );
+    }
+
+    private boolean isEmailUniqueViolation(DataIntegrityViolationException exception) {
+        Throwable cause = exception;
+
+        while (cause != null) {
+            String message = cause.getMessage();
+
+            if (message != null && message.contains("uk_merchants_email")) {
+                return true;
+            }
+            cause = cause.getCause();
+        }
+        return false;
+    }
+
+    private void runAfterCommit(Runnable action) {
+        if (TransactionSynchronizationManager.isActualTransactionActive() && TransactionSynchronizationManager.isSynchronizationActive()) {
+            TransactionSynchronizationManager.registerSynchronization(
+                    new TransactionSynchronization() {
+                        @Override
+                        public void afterCommit() {
+                            action.run();
+                        }
+                    }
+            );
+            return;
+        }
+        action.run();
     }
 }
